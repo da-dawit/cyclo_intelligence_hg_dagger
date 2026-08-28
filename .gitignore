@@ -95,3 +95,9 @@ Thumbs.db
 *.pth
 *.onnx
 *.engine
+
+# Editor/session backup files (not real source changes)
+*.bak
+orchestrator/ui/build.ORIGINAL/
+orchestrator/ui/build.bak_*/
+orchestrator/ui/build.log

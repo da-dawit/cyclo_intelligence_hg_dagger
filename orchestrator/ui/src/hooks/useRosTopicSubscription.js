@@ -296,9 +296,23 @@ export function useRosTopicSubscription() {
         }
 
         if (!monitorOnlyMessage) {
+          // task_info is only populated by the backend while a recording is
+          // actually in progress -- between episodes (record_phase back to
+          // READY) it reports task_num: '' even though the session's
+          // DataManager (and its real folder) is still alive. Only overwrite
+          // taskName/taskNum when the message actually carries a real one, so
+          // "End episode & label outcome" (clicked after the episode has
+          // already stopped) still has the right session identity to build
+          // bag_path from instead of falling back to task_name/episode_number.
+          const hasTaskNum = Boolean(msg.task_info?.task_num);
           dispatch(
             setRecordStatus({
-              taskName: msg.task_info?.task_name || 'idle',
+              ...(hasTaskNum
+                ? {
+                    taskName: msg.task_info?.task_name || 'idle',
+                    taskNum: msg.task_info.task_num,
+                  }
+                : {}),
               running: isRunning,
               recordPhase: currentPhase || 0,
               progress: Math.round(encodingProgress),

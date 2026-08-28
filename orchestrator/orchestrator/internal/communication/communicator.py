@@ -42,7 +42,7 @@ from rclpy.qos import (
     QoSProfile,
     ReliabilityPolicy
 )
-from std_msgs.msg import Empty, String
+from std_msgs.msg import Bool, Empty, String
 
 
 class Communicator:
@@ -108,6 +108,21 @@ class Communicator:
         node.get_logger().info(f'Camera info topics: {self.camera_info_topics}')
         node.get_logger().info(f'Rosbag extra topics: {self.rosbag_extra_topics}')
         node.get_logger().info(f'MCAP topics (v2): {self._mcap_topics}')
+
+        # /task/inference_status is published one-shot on phase transitions
+        # only. With VOLATILE durability a subscriber that attaches after a
+        # transition (the rosbag recorder always does -- recording starts
+        # AFTER the policy is INFERENCING) receives nothing until the next
+        # transition, leaving the opening segment of every online-RL episode
+        # with no phase to derive the `intervention` label from. TRANSIENT_LOCAL
+        # with depth 1 replays the current phase to late subscribers, which is
+        # the standard latched-status pattern.
+        self.inference_status_qos_profile = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST
+        )
 
         self.heartbeat_qos_profile = QoSProfile(
             depth=1,
@@ -179,7 +194,21 @@ class Communicator:
         self.inference_status_publisher = self.node.create_publisher(
             InferenceStatus,
             '/task/inference_status',
-            self.PUB_QOS_SIZE
+            self.inference_status_qos_profile
+        )
+
+        # /task/policy_active -- plain std_msgs/Bool mirror of the INFERENCING
+        # phase, for ai_worker to consume directly. interfaces (InferenceStatus)
+        # is not importable there (confirmed via ModuleNotFoundError, same
+        # boundary as robotis_interfaces the other way -- see leader_bridge.py),
+        # so cyclo_teleoperation_node can't subscribe to /task/inference_status
+        # itself. This lets it suppress its idle hold_target_ publish while the
+        # policy owns the shared follower command topic. Latched: a
+        # subscriber starting mid-session still gets the current value.
+        self.policy_active_publisher = self.node.create_publisher(
+            Bool,
+            '/task/policy_active',
+            self.inference_status_qos_profile
         )
 
         # /task/action_event publisher moved to cyclo_data.recorder.rosbag_control
@@ -242,6 +271,10 @@ class Communicator:
         msg.robot_type = robot_type
         msg.error = error
         self.inference_status_publisher.publish(msg)
+
+        policy_active_msg = Bool()
+        policy_active_msg.data = (phase == InferenceStatus.INFERENCING)
+        self.policy_active_publisher.publish(policy_active_msg)
 
     # publish_action_event moved to cyclo_data.recorder.rosbag_control.RosbagControl
     # (Step 3 Part C2d-1/-5). Orchestrator no longer owns /task/action_event.
@@ -527,6 +560,7 @@ class Communicator:
     def _cleanup_publishers(self):
         publisher_names = [
             'inference_status_publisher',
+            'policy_active_publisher',
             'heartbeat_publisher',
         ]
         for publisher_name in publisher_names:

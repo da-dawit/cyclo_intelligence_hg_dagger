@@ -17,6 +17,7 @@
 """Metadata manager for ROSbag robot_config.yaml files."""
 
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -201,6 +202,58 @@ class MetadataManager:
         except Exception as e:
             self._log_error(f"Failed to load episode_info.json: {e}")
             return {}
+
+    VALID_OUTCOMES = ("SUCCESS", "FAILURE", "DISCARD")
+
+    def write_episode_outcome(
+        self,
+        bag_path: Path,
+        outcome: str,
+        success_frame: Optional[int] = None,
+    ) -> bool:
+        """Merge an online-RL outcome into episode_info.json.
+
+        HG-DAgger drops non-SUCCESS episodes by default and HIL-SERL derives
+        its sparse reward from success_frame, so an episode saved without an
+        outcome is unusable by two of the three methods.
+        """
+        outcome = str(outcome or "").upper()
+        if outcome not in self.VALID_OUTCOMES:
+            self._log_error(
+                f"Invalid outcome {outcome!r}; expected one of {self.VALID_OUTCOMES}"
+            )
+            return False
+
+        info_path = Path(bag_path) / "episode_info.json"
+        data: Dict = {}
+        if info_path.exists():
+            try:
+                with open(info_path, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    data = loaded
+            except Exception as e:  # noqa: BLE001
+                self._log_error(f"Failed to read episode_info.json: {e}")
+                return False
+
+        data["outcome"] = outcome
+        if success_frame is not None:
+            try:
+                data["success_frame"] = int(success_frame)
+            except (TypeError, ValueError):
+                data.pop("success_frame", None)
+        else:
+            data.pop("success_frame", None)
+
+        tmp_path = info_path.with_suffix(".json.tmp")
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            os.replace(tmp_path, info_path)
+        except Exception as e:  # noqa: BLE001
+            self._log_error(f"Failed to write episode_info.json: {e}")
+            return False
+        return True
 
     def get_episode_segments(
         self,

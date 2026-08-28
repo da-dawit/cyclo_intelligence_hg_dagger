@@ -5,6 +5,14 @@ orchestrator:
       urdf_path: urdf/ffw_sg2_follower.urdf
       joystick:
         trigger_topic: /leader/joystick_controller/tact_trigger
+        # A2 leader: one tact press both toggles that arm's teleop engage AND
+        # fires this record trigger. During online-RL the second effect is a
+        # hazard -- reaching for it while the policy is INFERENCING engages a
+        # leader arm, and leader + policy publish to the SAME
+        # /leader/joint_trajectory_command_broadcaster_*/joint_trajectory topic.
+        # Disabled here; the arm engage toggle is unaffected. Set true to
+        # restore joystick-driven recording.
+        record_triggers_enabled: false
 
       # ────────────────────────────────────────────────────────────────
       # Observation — every signal the policy reads from the robot.
@@ -123,6 +131,22 @@ orchestrator:
       # ────────────────────────────────────────────────────────────────
       recording:
         extra_topics:
+          # Source of the per-frame `intervention` label for online-RL runs.
+          # InferenceStatus.inference_phase: READY=0 LOADING=1 INFERENCING=2
+          # PAUSED=3. Published one-shot on transitions only, so the converter
+          # must forward-fill and seed the value at episode start.
+          - /task/inference_status
+          # /leader/teleoperation/control_status intentionally NOT here.
+          # robotis_interfaces (its message package) isn't installed where
+          # service_bag_recorder runs, so adding it made every recording
+          # setup call fail with "typesupport library ... could not be
+          # found" -- which cascaded into killing the whole launch group,
+          # including the orchestrator, after every teleop takeover. See
+          # [[groot-checkpoint-is-lerobot-format]]-adjacent finding: same
+          # missing-package issue as the live UI badge, different process.
+          # Fix path: record leader_bridge.py's plain std_msgs/String
+          # /leader/teleoperation/active_arms_str instead (same information,
+          # a type every environment can load) once that's wired up.
           - /tf
           - /zed/zed_node/left/camera_info
           - /zed/zed_node/right/camera_info

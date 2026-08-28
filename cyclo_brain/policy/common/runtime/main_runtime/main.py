@@ -99,6 +99,7 @@ class MainRuntime:
                 "REFILL_LATENCY_SAMPLE_MAX_S", "2.0"
             ),
             action_request_mode=os.environ.get("ACTION_REQUEST_MODE", "async"),
+            blend_duration_s=self._optional_float_env("BLEND_DURATION_S", "none"),
         )
         self._engine_client = engine_client
         self._command_srv = None

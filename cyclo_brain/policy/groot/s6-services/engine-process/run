@@ -16,6 +16,19 @@ echo "[engine-process] ROS_DOMAIN_ID=${ROS_DOMAIN_ID}"
 echo "[engine-process] RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION}"
 echo "[engine-process] ZENOH_CONFIG_OVERRIDE=${ZENOH_CONFIG_OVERRIDE}"
 
+# /gr00t is baked into the image, not bind-mounted, so a live docker-exec
+# patch does not survive a container recreate. Applying it here (idempotent)
+# keeps it in effect across restarts without a full image rebuild.
+# CropToSquare (crop_to_square.patch) swaps the letterbox-pad eval transform
+# for a square crop the dawity/groot_screwing35 16d_30k checkpoint was
+# trained with -- gated by GR00T_SQUARE_CROP, so unset/0 falls back to
+# stock LetterBoxPad and this is a silent no-op.
+_AUG_FILE=/gr00t/gr00t/model/gr00t_n1d7/image_augmentations.py
+if ! grep -q "class CropToSquare" "${_AUG_FILE}" 2>/dev/null; then
+  echo "[engine-process] applying crop_to_square.patch to ${_AUG_FILE}"
+  patch -p1 -d /gr00t < /etc/s6-overlay/s6-rc.d/engine-process/crop_to_square.patch
+fi
+
 export PYTHONPATH="/app:/policy_runtime:${ZENOH_SDK_PATH:-/zenoh_sdk}:${ROBOT_CLIENT_SDK_PATH:-/robot_client_sdk}${PYTHONPATH:+:${PYTHONPATH}}"
 python3 /policy_runtime/hf_token_sync.py || true
 exec python3 -m engine_process

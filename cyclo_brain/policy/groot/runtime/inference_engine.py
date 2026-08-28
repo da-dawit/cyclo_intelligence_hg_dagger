@@ -722,19 +722,33 @@ class GR00TInference:
             return self.fail("Not in inference mode")
 
         try:
+            t_start = time.monotonic()
             images = self.robot.get_images(format="rgb")
             joints = self.robot.get_joint_positions()
+            t_obs = time.monotonic()
             task = request.task_instruction
 
             observation = self.preprocess(images, joints, task)
             if "success" in observation:
                 return observation
+            t_preprocess = time.monotonic()
 
-            t0 = time.monotonic()
             self.logger.info("Running GR00T inference...")
             action, info = self.policy.get_action(observation)
-            self.logger.info("GR00T inference completed in %.3fs", time.monotonic() - t0)
-            return self.postprocess_action(action)
+            t_inference = time.monotonic()
+            self.logger.info("GR00T inference completed in %.3fs", t_inference - t_preprocess)
+            result = self.postprocess_action(action)
+            t_postprocess = time.monotonic()
+            self.logger.info(
+                "get_action_chunk stage timing -- obs=%.3fs preprocess=%.3fs "
+                "inference=%.3fs postprocess=%.3fs total_in_process=%.3fs",
+                t_obs - t_start,
+                t_preprocess - t_obs,
+                t_inference - t_preprocess,
+                t_postprocess - t_inference,
+                t_postprocess - t_start,
+            )
+            return result
 
         except Exception as e:
             self.logger.error("Inference failed: %s", e, exc_info=True)

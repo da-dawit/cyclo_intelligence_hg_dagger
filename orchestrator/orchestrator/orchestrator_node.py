@@ -26,6 +26,8 @@ import time
 import traceback
 from typing import Optional
 
+from std_msgs.msg import Empty
+
 from ament_index_python.packages import get_package_share_directory
 from interfaces.msg import (
     BrowserItem,
@@ -152,6 +154,7 @@ class OrchestratorNode(Node):
         self.robot_type = ''
         self.on_recording = False
         self.on_inference = False
+        self._current_inference_phase = InferenceStatus.READY
 
         self.robot_type_list = self.get_robot_type_list()
         self.start_recording_time: float = 0.0
@@ -176,6 +179,7 @@ class OrchestratorNode(Node):
 
         self._init_ros_publisher()
         self._init_cyclo_data_bridge()
+        self._init_pause_gesture_subscriber()
         self._init_ros_service()
 
         self._setup_timer_callbacks()
@@ -248,6 +252,43 @@ class OrchestratorNode(Node):
             'cyclo_data bridge initialised (CycloDataClient + '
             '/data/status subscriber active).'
         )
+
+    def _init_pause_gesture_subscriber(self):
+        """Right-stick drag-down toggle: pause the policy, or resume it.
+
+        ai_worker owns the leader hardware and can't decode interfaces
+        (InferenceStatus) -- confirmed unavailable there, same boundary as
+        robotis_interfaces the other way (see leader_bridge.py). A small
+        gesture-detector node running on that side watches the raw joystick
+        axes and fires a plain std_msgs/Empty edge event here whenever the
+        stick is held past threshold for ~1s. One topic, two meanings,
+        decided by which phase we are currently in.
+        """
+        self._pause_gesture_sub = self.create_subscription(
+            Empty,
+            '/leader/teleoperation/toggle_pause_request',
+            self._handle_toggle_pause_gesture,
+            self.PUB_QOS_SIZE,
+        )
+        self.get_logger().info(
+            'Pause-gesture subscriber initialised: '
+            '/leader/teleoperation/toggle_pause_request'
+        )
+
+    def _handle_toggle_pause_gesture(self, _msg: Empty) -> None:
+        with self._state_lock:
+            phase = self._current_inference_phase
+        if phase == InferenceStatus.INFERENCING:
+            success, message = self._pause_inference()
+            self.get_logger().info(f'Gesture pause: {success} ({message})')
+        elif phase == InferenceStatus.PAUSED:
+            success, message = self._resume_inference()
+            self.get_logger().info(f'Gesture resume: {success} ({message})')
+        else:
+            self.get_logger().info(
+                f'Pause-gesture ignored: no active inference session '
+                f'(phase={phase})'
+            )
 
     def _snapshot_session_state(self):
         """Atomic read of (on_recording, on_inference) under _state_lock.
@@ -887,6 +928,8 @@ class OrchestratorNode(Node):
         only signals LOADING / INFERENCING / PAUSED / READY on commands.
         Record-side phase lives on /data/recording/status (D18).
         """
+        with self._state_lock:
+            self._current_inference_phase = phase
         if self.communicator is None:
             return
         robot_type = getattr(self, 'robot_type', '') or ''
@@ -1832,45 +1875,19 @@ class OrchestratorNode(Node):
                             self._apply_cyclo_data_response(cd_result, response)
 
                     elif request.command == SendCommand.Request.STOP_INFERENCE:
-                        with self._state_lock:
-                            client = self.container_service_client
-                        if client is not None:
-                            result = client.inference_command(
-                                ContainerServiceClient.CMD_PAUSE,
-                            )
-                            if result.success:
-                                self._publish_inference_phase(InferenceStatus.PAUSED)
-                            response.success = result.success
-                            response.message = result.message or 'Inference paused'
-                        else:
-                            response.success = False
-                            response.message = 'No inference session active'
+                        result, message = self._pause_inference()
+                        response.success = result
+                        response.message = message
 
                     elif request.command == SendCommand.Request.RESUME_INFERENCE:
-                        with self._state_lock:
-                            client = self.container_service_client
-                            loaded_publish_to_robot = (
-                                self._loaded_inference_publish_to_robot
-                            )
-                        if client is not None:
-                            task_instruction = (
-                                request.task_info.task_instruction[0]
-                                if request.task_info.task_instruction
-                                else ''
-                            )
-                            result = client.inference_command(
-                                ContainerServiceClient.CMD_RESUME,
-                                task_instruction=task_instruction,
-                                publish_to_robot=loaded_publish_to_robot,
-                            )
-                            if result.success:
-                                self.on_inference = True
-                                self._publish_inference_phase(InferenceStatus.INFERENCING)
-                            response.success = result.success
-                            response.message = result.message or 'Inference resumed'
-                        else:
-                            response.success = False
-                            response.message = 'No inference session active'
+                        task_instruction = (
+                            request.task_info.task_instruction[0]
+                            if request.task_info.task_instruction
+                            else ''
+                        )
+                        result, message = self._resume_inference(task_instruction)
+                        response.success = result
+                        response.message = message
 
                     elif request.command == SendCommand.Request.UPDATE_INSTRUCTION:
                         # Mid-run language re-conditioning. Lifecycle stays
@@ -2802,6 +2819,37 @@ class OrchestratorNode(Node):
             )
             self.get_logger().error(f'Trigger inference CANCEL failed: {message}')
 
+    def _pause_inference(self) -> tuple[bool, str]:
+        """Pause the running policy. Shared by the UI's STOP_INFERENCE
+        command and the right-stick drag-down gesture -- one behaviour,
+        two entry points, so they cannot drift apart."""
+        with self._state_lock:
+            client = self.container_service_client
+        if client is None:
+            return False, 'No inference session active'
+        result = client.inference_command(ContainerServiceClient.CMD_PAUSE)
+        if result.success:
+            self._publish_inference_phase(InferenceStatus.PAUSED)
+        return result.success, (result.message or 'Inference paused')
+
+    def _resume_inference(self, task_instruction: str = '') -> tuple[bool, str]:
+        """Resume the paused policy. Shared by RESUME_INFERENCE and the
+        gesture handler. See _pause_inference for why this is factored out."""
+        with self._state_lock:
+            client = self.container_service_client
+            loaded_publish_to_robot = self._loaded_inference_publish_to_robot
+        if client is None:
+            return False, 'No inference session active'
+        result = client.inference_command(
+            ContainerServiceClient.CMD_RESUME,
+            task_instruction=task_instruction,
+            publish_to_robot=loaded_publish_to_robot,
+        )
+        if result.success:
+            self.on_inference = True
+            self._publish_inference_phase(InferenceStatus.INFERENCING)
+        return result.success, (result.message or 'Inference resumed')
+
     def handle_joystick_trigger(self, joystick_mode: str):
         """
         Handle leader tact triggers as backend-owned recording controls.
@@ -2816,6 +2864,14 @@ class OrchestratorNode(Node):
             return
 
         if joystick_mode in ('right', 'left'):
+            joystick_cfg = robot_schema.get_joystick_topics(self.robot_section)
+            if not joystick_cfg.get('record_triggers_enabled', True):
+                self.get_logger().info(
+                    f'Joystick record trigger ignored (record_triggers_enabled '
+                    f'is false): {joystick_mode}. Arm engage toggle is unaffected '
+                    f'-- it is published by the controller, not routed through here.'
+                )
+                return
             snapshot_on_recording, snapshot_on_inference = (
                 self._snapshot_session_state()
             )

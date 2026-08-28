@@ -54,7 +54,7 @@ from sensor_msgs.msg import CompressedImage
 
 
 _SUB_QOS = QoSProfile(
-    depth=200,
+    depth=1,
     reliability=ReliabilityPolicy.BEST_EFFORT,
     durability=DurabilityPolicy.VOLATILE,
     history=HistoryPolicy.KEEP_LAST,
@@ -1723,3 +1723,4 @@ class VideoRecorder:
             except ValueError:
                 continue
         return -1
+

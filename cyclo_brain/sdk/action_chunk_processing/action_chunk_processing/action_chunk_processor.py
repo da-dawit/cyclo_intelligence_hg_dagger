@@ -19,10 +19,25 @@
 from __future__ import annotations
 
 import collections
+import logging
 import threading
 from typing import Dict, List, Optional
 
 import numpy as np
+
+# Plain stdlib logger, deliberately not zenoh_ros2_sdk's get_logger() -- that
+# resolves under the "zenoh_ros2_sdk" logger, which is capped at WARNING in
+# zenoh_ros2_sdk/logger.py and silently drops .info()/.debug() calls.
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+if not any(isinstance(h, logging.StreamHandler) for h in logger.handlers):
+    _handler = logging.StreamHandler()
+    _handler.setLevel(logging.INFO)
+    _handler.setFormatter(logging.Formatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    logger.addHandler(_handler)
 
 
 class ActionChunkProcessor:
@@ -37,6 +52,7 @@ class ActionChunkProcessor:
         postprocess: bool = True,
         target_chunk_size: Optional[int] = None,
         alignment_mode: str = "l2",
+        blend_duration_s: Optional[float] = None,
     ):
         self._inference_hz = float(inference_hz)
         self._control_hz = float(control_hz)
@@ -45,7 +61,17 @@ class ActionChunkProcessor:
         if self._control_hz <= 0.0:
             raise ValueError("control_hz must be positive")
         self._chunk_align_window_s = max(0.0, float(chunk_align_window_s))
-        self._blend_steps = max(1, int(self.BLEND_DURATION_S * self._control_hz))
+        # BLEND_DURATION_S was tuned as a fixed constant against a 40-step-horizon
+        # model's ~2.67s chunks (~7-8% of a chunk spent blending). A shorter-horizon
+        # model (e.g. 16 steps, ~1.07s) hits refills much faster, so the same fixed
+        # duration eats a much larger share of what actually executes before the
+        # next splice -- constructor override lets a deployment scale it back down
+        # to match the model actually loaded, instead of silently eating into the
+        # commanded motion. Falls back to the class constant when not given.
+        resolved_blend_duration_s = (
+            self.BLEND_DURATION_S if blend_duration_s is None else float(blend_duration_s)
+        )
+        self._blend_steps = max(1, int(resolved_blend_duration_s * self._control_hz))
         self._postprocess = bool(postprocess)
         self._target_chunk_size = target_chunk_size
         self._alignment_mode = str(alignment_mode).lower()
@@ -58,6 +84,28 @@ class ActionChunkProcessor:
         self._last_action: Optional[np.ndarray] = None
         self._last_output_action: Optional[np.ndarray] = None
         self._lock = threading.Lock()
+
+    def seed_anchor(self, action: np.ndarray) -> bool:
+        """Seed the blend/alignment anchor with the robot's current pose.
+
+        On the first chunk after START there is no anchor -- the buffer is
+        empty and no action has been produced -- so ``_blend`` returns the
+        chunk untouched and the very first command jumps straight from the
+        robot's actual pose to the policy's first prediction. That is the
+        lunge seen at the start of a rollout. Seeding with the current pose
+        makes the first BLEND_DURATION_S of the chunk ramp out of where the
+        robot actually is.
+
+        No-op if an anchor already exists, so it can be called freely.
+        """
+        with self._lock:
+            if self._last_action is not None or self._buffer:
+                return False
+            arr = np.asarray(action, dtype=np.float64).reshape(-1)
+            if arr.size == 0 or not np.all(np.isfinite(arr)):
+                return False
+            self._last_action = arr.copy()
+            return True
 
     @property
     def buffer_size(self) -> int:
@@ -162,6 +210,7 @@ class ActionChunkProcessor:
             return chunk
         window_n = int(round(self._chunk_align_window_s * self._inference_hz))
         window_n = max(1, window_n)
+        expected_idx = None
         if scheduled_start_delay_s is None:
             search_start = 0
             search_stop = min(window_n, len(chunk))
@@ -182,7 +231,22 @@ class ActionChunkProcessor:
                 search_stop = min(len(chunk), expected_idx + window_n + 1)
         distances = np.linalg.norm(chunk[search_start:search_stop] - anchor, axis=1)
         best_idx = search_start + int(np.argmin(distances))
+        best_dist = float(distances[best_idx - search_start])
         start_idx = best_idx + 1
+        dropped = start_idx >= len(chunk) and not late_fallback
+        logger.info(
+            "l2_align -- scheduled_start_delay=%s expected_idx=%s chunk_len=%d "
+            "window=[%d,%d) best_idx=%d best_dist=%.4f late_fallback=%s dropped=%s",
+            "none" if scheduled_start_delay_s is None else f"{scheduled_start_delay_s:.3f}s",
+            expected_idx,
+            len(chunk),
+            search_start,
+            search_stop,
+            best_idx,
+            best_dist,
+            late_fallback,
+            dropped,
+        )
         if start_idx >= len(chunk):
             if late_fallback:
                 return chunk

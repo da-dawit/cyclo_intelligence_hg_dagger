@@ -327,6 +327,14 @@ const initialState = {
   // record-session state.
   recordStatus: {
     taskName: 'idle',
+    // Inference/online-RL recordings force task_name to the literal string
+    // 'inference' server-side (session_manager.py's _make_save_repo_name)
+    // -- the real per-session identity lives in task_num (the record's
+    // timestamp component), which the folder is actually named after:
+    // Task_{taskNum}_{taskName}_MCAP. Needed to submit an outcome against
+    // the real path rather than the naive (and wrong, for inference
+    // recordings) <task_name>/<episode_number>.
+    taskNum: '',
     running: false,
     recordPhase: RecordPhase.READY,
     progress: 0,

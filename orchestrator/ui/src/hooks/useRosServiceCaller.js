@@ -22,6 +22,10 @@ import TaskCommand from '../constants/taskCommand';
 import TrainingCommand from '../constants/trainingCommand';
 import EditDatasetCommand from '../constants/commands';
 import rosConnectionManager from '../utils/rosConnectionManager';
+import {
+  HOME_POSE_GROUPS,
+  HOME_POSE_DURATION_SEC,
+} from '../constants/homePose';
 import { DEFAULT_PATHS } from '../constants/paths';
 import {
   selectInferenceTaskInfo,
@@ -146,6 +150,68 @@ export function useRosServiceCaller() {
   useEffect(() => { editDatasetInfoRef.current = editDatasetInfo; }, [editDatasetInfo]);
   useEffect(() => { pageRef.current = page; }, [page]);
 
+  // Publish the follower's configured home pose. Used by the Online-RL page so
+  // the operator can re-home without leaving the page or hand-writing
+  // `ros2 topic pub`. Publishes on the REMAPPED /leader/... topics -- the
+  // controller-named topics have no subscribers (see constants/homePose.js).
+  const publishHomePose = useCallback(async () => {
+    const ros = await rosConnectionManager.getConnection(rosbridgeUrl);
+    if (!ros || !ros.isConnected) {
+      throw new Error('ROS connection is not available');
+    }
+    // cyclo_teleoperation_node and a2_joystick_controller both continuously
+    // republish their own idle-hold position onto these exact same topics
+    // (roughly every control-loop tick) -- without this signal, that
+    // republish overwrites the one-shot home trajectory below within
+    // ~10ms, so the arm never visibly reaches home. Both nodes suppress
+    // their own publish while this is true; see home_in_progress_ in
+    // cyclo_teleoperation_node.cpp / joystick_controller.cpp.
+    const homeInProgressTopic = new ROSLIB.Topic({
+      ros,
+      name: '/leader/teleoperation/home_in_progress',
+      messageType: 'std_msgs/msg/Bool',
+    });
+    homeInProgressTopic.publish(new ROSLIB.Message({ data: true }));
+
+    const sent = [];
+    for (const group of HOME_POSE_GROUPS) {
+      const topic = new ROSLIB.Topic({
+        ros,
+        name: group.topic,
+        messageType: 'trajectory_msgs/msg/JointTrajectory',
+      });
+      topic.publish(new ROSLIB.Message({
+        joint_names: group.jointNames,
+        points: [{
+          positions: group.positions,
+          velocities: [],
+          accelerations: [],
+          effort: [],
+          time_from_start: { sec: HOME_POSE_DURATION_SEC, nanosec: 0 },
+        }],
+      }));
+      sent.push(group.label);
+    }
+
+    // Release suppression once the trajectory has had time to finish, not
+    // immediately -- this call resolves as soon as messages are sent, well
+    // before the 10s move completes. The capture on release reads the
+    // follower's ACTUAL position at that instant (see cyclo_teleoperation_node's
+    // home_in_progress_ falling edge) -- if the real move (especially the
+    // gripper, which may converge slower than the arm joints) hasn't finished
+    // by exactly HOME_POSE_DURATION_SEC, that capture freezes it mid-motion
+    // instead of at the true target. This margin is settling slack on top of
+    // the commanded trajectory duration, not part of it.
+    const HOME_POSE_SETTLE_MARGIN_SEC = 3;
+    setTimeout(() => {
+      try {
+        homeInProgressTopic.publish(new ROSLIB.Message({ data: false }));
+      } catch (e) { /* connection may have dropped by then; nothing to do */ }
+    }, (HOME_POSE_DURATION_SEC + HOME_POSE_SETTLE_MARGIN_SEC) * 1000);
+
+    return sent;
+  }, [rosbridgeUrl]);
+
   const callService = useCallback(
     async (serviceName, serviceType, request, timeoutMs = DEFAULT_SERVICE_TIMEOUT_MS) => {
       try {
@@ -224,7 +290,12 @@ export function useRosServiceCaller() {
       // Read latest values from refs at call time so this callback's
       // identity stays stable across taskInfo / page mutations.
       const page = pageRef.current;
-      const taskInfo = page === PageType.INFERENCE
+      // ONLINE_RL drives the same inference session as the Inference page, so
+      // it must send inferenceTaskInfo -- otherwise inference commands issued
+      // from that page would carry the record page's task info.
+      const taskInfo = (
+        page === PageType.INFERENCE || page === PageType.ONLINE_RL
+      )
         ? inferenceTaskInfoRef.current
         : recordTaskInfoRef.current;
       try {
@@ -313,7 +384,13 @@ export function useRosServiceCaller() {
 
         if (page === PageType.RECORD) {
           taskType = 'record';
-        } else if (page === PageType.INFERENCE) {
+        } else if (
+          page === PageType.INFERENCE || page === PageType.ONLINE_RL
+        ) {
+          // ONLINE_RL drives the same inference session. Without this the
+          // task_type reaches the orchestrator as '' and FINISH takes the
+          // record branch -- "Clear" would stop the recording but never
+          // unload the model (orchestrator_node.py: is_inference_clear).
           taskType = 'inference';
         }
 
@@ -1006,6 +1083,7 @@ export function useRosServiceCaller() {
   );
 
   return {
+    publishHomePose,
     callService,
     sendRecordCommand,
     getImageTopicList,

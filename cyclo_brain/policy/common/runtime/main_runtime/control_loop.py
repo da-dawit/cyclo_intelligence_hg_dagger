@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import sys
@@ -44,6 +45,21 @@ except Exception:  # pragma: no cover
 
 
 logger = get_logger("main_runtime.control_loop")
+# get_logger() resolves to a child of the "zenoh_ros2_sdk" logger, whose
+# level (and attached handler) are set to WARNING in zenoh_ros2_sdk/logger.py
+# -- .info()/.debug() calls here were silently dropped before ever reaching
+# a handler. Give this logger its own INFO-level handler instead of raising
+# the shared zenoh_ros2_sdk logger's level, which would make unrelated SDK
+# logging noisier too.
+logger.setLevel(logging.INFO)
+if not any(isinstance(h, logging.StreamHandler) for h in logger.handlers):
+    _handler = logging.StreamHandler()
+    _handler.setLevel(logging.INFO)
+    _handler.setFormatter(logging.Formatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    logger.addHandler(_handler)
 
 ACTION_REQUEST_MODE_ASYNC = "async"
 ACTION_REQUEST_MODE_SYNC = "sync"
@@ -73,11 +89,15 @@ class ControlLoop:
         latency_warmup_samples: int = 1,
         max_refill_latency_s: Optional[float] = 2.0,
         action_request_mode: str = ACTION_REQUEST_MODE_ASYNC,
+        blend_duration_s: Optional[float] = None,
     ) -> None:
         self._requester = requester
         self._inference_hz = float(inference_hz)
         self._control_hz = float(control_hz)
         self._chunk_align_window_s = float(chunk_align_window_s)
+        self._blend_duration_s = (
+            None if blend_duration_s is None else float(blend_duration_s)
+        )
         self._target_chunk_size = target_chunk_size
         self._postprocess_actions = bool(postprocess_actions)
         self._alignment_mode = alignment_mode
@@ -132,6 +152,7 @@ class ControlLoop:
                 inference_hz=self._inference_hz,
                 control_hz=self._control_hz,
                 chunk_align_window_s=self._chunk_align_window_s,
+                blend_duration_s=self._blend_duration_s,
                 postprocess=self._postprocess_actions,
                 target_chunk_size=self._target_chunk_size,
                 alignment_mode=self._alignment_mode,
@@ -223,6 +244,28 @@ class ControlLoop:
             self._thread.join(timeout=2.0)
         self.deconfigure()
 
+    def _current_action_vector(self, robot, action_keys) -> Optional[np.ndarray]:
+        """Follower pose laid out in the same order publish_action slices.
+
+        State groups are named follower_<key> for action key <key>; the widths
+        match because both come from the same robot config entry.
+        """
+        parts = []
+        for key in action_keys:
+            try:
+                positions = robot.get_joint_positions(f"follower_{key}")
+            except Exception:  # noqa: BLE001
+                return None
+            if positions is None:
+                return None
+            arr = np.asarray(positions, dtype=np.float64).reshape(-1)
+            if arr.size == 0:
+                return None
+            parts.append(arr)
+        if not parts:
+            return None
+        return np.concatenate(parts)
+
     def tick(self) -> None:
         with self._lock:
             if not self._running or self._robot is None or self._processor is None:
@@ -283,6 +326,7 @@ class ControlLoop:
             return
         latency_s = time.monotonic() - started_at
         self._record_request_latency(latency_s)
+        logger.info("get_action round-trip: %.3fs", latency_s)
         if not response.success:
             logger.warning("get_action failed: %s", response.message)
             return
@@ -314,6 +358,15 @@ class ControlLoop:
                     if action_request_mode == ACTION_REQUEST_MODE_SYNC
                     else latency_s + buffer_delay_s
                 )
+                # Seed the blend anchor with where the robot actually is, so
+                # the first chunk ramps out of the current pose instead of
+                # snapping to the policy's first prediction (start-of-rollout
+                # lunge). No-op once an anchor exists.
+                seed = self._current_action_vector(self._robot, self._action_keys)
+                if seed is not None and self._processor.seed_anchor(seed):
+                    logger.info(
+                        "seeded action anchor from current pose (%d dims)", seed.size
+                    )
                 produced = self._processor.push_actions(
                     chunk,
                     scheduled_start_delay_s=scheduled_start_delay_s,
@@ -324,7 +377,7 @@ class ControlLoop:
                     if scheduled_start_delay_s is None
                     else f"{scheduled_start_delay_s:.3f}s"
                 )
-                logger.debug(
+                logger.info(
                     "buffered action chunk: source=%d produced=%d "
                     "mode=%s latency=%.3fs buffer_delay=%.3fs "
                     "scheduled_start=%s",

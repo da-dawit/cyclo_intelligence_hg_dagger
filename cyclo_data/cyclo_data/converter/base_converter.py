@@ -385,6 +385,14 @@ class ConversionConfig:
     # Audit metadata for the root info.json conversion_config snapshot.
     source_rosbags: List[str] = field(default_factory=list)
 
+    # Relabel action[t] from the leader's raw command to the follower's own
+    # future state at t+action_lead_frames. Off by default -- see
+    # BaseConverter._relabel_action_from_follower_lead for why the leader
+    # label is wrong (it desyncs from the follower permanently across an
+    # arm freeze/disengage) and how action_lead_frames=5 was validated.
+    relabel_action_to_follower_lead: bool = False
+    action_lead_frames: int = 5
+
 
 @dataclass
 class EpisodeData:
@@ -414,6 +422,51 @@ class EpisodeData:
     frame_reuse_reports: List[Dict[str, Any]] = field(default_factory=list)
     observation_state_names: List[str] = field(default_factory=list)
     action_names: List[str] = field(default_factory=list)
+    # ---- online-RL (HG-DAgger / IWR / HIL-SERL) -----------------------------
+    # Per-frame: 0 policy drove, 1 human drove, -1 excluded (no policy running,
+    # or handoff transient). Derived from /task/inference_status by
+    # ``_assign_intervention_flags``. Empty when the topic is absent, in which
+    # case no intervention column is emitted at all -- an all-zero column would
+    # be indistinguishable from a genuine all-autonomous run.
+    intervention_flags: List[int] = field(default_factory=list)
+    # Per-frame training weight. Reproduces the real-robot DAgger weighting
+    # in Larchenko's LeHome Challenge solution (arXiv:2606.27163 S9.10,
+    # Figure 17) exactly: human-correction frames at 2.0 (highest), plain
+    # autonomous frames at a 0.3 baseline (the policy is mostly just doing
+    # fine on its own -- little new signal), ramping linearly to 0.0 over
+    # the _PRE_PAUSE_RAMP_SECONDS (5s) immediately before a takeover -- those
+    # are the frames from just before a human judged the policy was
+    # failing, so training on them at baseline weight would reinforce the
+    # exact behaviour that caused the takeover. Excluded frames (handoff/
+    # slow-start, no policy running) stay at a neutral 1.0; they're already
+    # dropped via intervention=-1, not through this column. This is the
+    # paper's own "crude hand-tuned" substitute for real advantage/value-
+    # based weighting -- it explicitly is not that, see the S9.10 discussion.
+    sample_weight: List[float] = field(default_factory=list)
+    # Per-frame sparse reward for HIL-SERL: 1 from ``success_frame`` onward on
+    # SUCCESS episodes, else 0. HG-DAgger/IWR ignore this.
+    rewards: List[int] = field(default_factory=list)
+    # Per-frame episode-terminal flag; True only on the final frame.
+    dones: List[bool] = field(default_factory=list)
+    # Per-episode, written to meta/episodes (NOT the per-frame parquet).
+    outcome: str = ""
+    success_frame: Optional[int] = None
+    n_intervention: int = 0
+    n_auto: int = 0
+    # Per leader topic, (log_time_sec, time_from_start_ns). The a2 broadcaster
+    # stamps a non-zero time_from_start while it is still slow-start
+    # retargeting the leader onto the follower, and Duration(0,0) once synced.
+    # Those retargeting frames are machine motion, not a human command.
+    leader_sync_messages: Dict[str, List[Tuple[float, int]]] = field(
+        default_factory=dict
+    )
+    # (log_time_sec, active_arms) from /leader/teleoperation/control_status.
+    # PAUSED means the POLICY stopped, not that a human is driving -- the
+    # operator may simply be looking at the scene. active_arms tells us whether
+    # the leader is actually engaged.
+    teleop_active_arms_messages: List[Tuple[float, str]] = field(default_factory=list)
+    # Raw (log_time_sec, inference_phase) pairs read from /task/inference_status.
+    inference_phase_messages: List[Tuple[float, int]] = field(default_factory=list)
 
 
 class RosbagToLerobotConverterBase:
@@ -1153,6 +1206,12 @@ class RosbagToLerobotConverterBase:
             episode_data.video_files = {}
 
         self._assign_subtask_indices(episode_data)
+        # Frame grid is final here (grid_log_times_sec truncated to length),
+        # so the causal fill lands on the same rows the parquet will carry.
+        self._assign_intervention_flags(episode_data)
+        self._assign_reward_and_done(episode_data)
+        self._assign_sample_weights(episode_data)
+        self._relabel_action_from_follower_lead(episode_data)
 
         task_markers = self._metadata_manager.get_task_markers(bag_path)
         if task_markers:
@@ -1174,6 +1233,17 @@ class RosbagToLerobotConverterBase:
         if not info:
             return
         episode_data.task_name = str(info.get("task_name", "") or "")
+        # Online-RL per-episode labels. Written by the Online-RL page via
+        # MetadataManager.write_episode_outcome(). Absent on ordinary teleop
+        # recordings, which leaves outcome "" -> reward stays all-zero.
+        episode_data.outcome = str(info.get("outcome", "") or "").upper()
+        raw_success_frame = info.get("success_frame", None)
+        try:
+            episode_data.success_frame = (
+                int(raw_success_frame) if raw_success_frame is not None else None
+            )
+        except (TypeError, ValueError):
+            episode_data.success_frame = None
         episode_data.recording_mode = str(info.get("recording_mode", "single") or "single")
         try:
             episode_data.full_episode_index = int(
@@ -1750,6 +1820,354 @@ class RosbagToLerobotConverterBase:
             f"subtask segment(s) into {stitched.length} continuous frames"
         )
         return stitched
+
+    # inference_phase constants (interfaces/msg/InferenceStatus.msg)
+    _PHASE_READY = 0
+    _PHASE_LOADING = 1
+    _PHASE_INFERENCING = 2
+    _PHASE_PAUSED = 3
+    INFERENCE_STATUS_TOPIC = "/task/inference_status"
+    # Matches Larchenko's LeHome Challenge real-robot DAgger weighting
+    # (arXiv:2606.27163 Figure 17) exactly, including the 5s window --
+    # see _assign_sample_weights.
+    _PRE_PAUSE_RAMP_SECONDS = 5.0
+    _HUMAN_SAMPLE_WEIGHT = 2.0
+    _AUTONOMOUS_BASELINE_WEIGHT = 0.3
+    # Driver-grasp and screw-in are where the policy fails hardest (see
+    # DEPLOY_30K.md's driver-grasp drift numbers) -- human corrections there
+    # carry far more signal than an average takeover, so they get their own,
+    # much higher weight instead of the flat _HUMAN_SAMPLE_WEIGHT. Matched by
+    # substring against the subtask instruction text (not a hardcoded stage
+    # index) since stage ordering isn't guaranteed across recordings.
+    _HARD_STAGE_HUMAN_WEIGHT = 6.0
+    _HARD_STAGE_KEYWORDS = ("driver", "screw")
+
+    def _read_inference_phases(self, reader) -> List[Tuple[float, int]]:
+        """Collect (log_time_sec, inference_phase) from /task/inference_status.
+
+        Read in a separate cheap pass rather than through the joint-data hot
+        path: the topic is one-shot on transitions, so an episode carries a
+        handful of messages at most.
+        """
+        phases: List[Tuple[float, int]] = []
+        try:
+            for topic, msg, ts in reader.read_messages(
+                topic_filter=[self.INFERENCE_STATUS_TOPIC]
+            ):
+                if topic != self.INFERENCE_STATUS_TOPIC:
+                    continue
+                phase = getattr(msg, "inference_phase", None)
+                if phase is None:
+                    continue
+                phases.append((float(ts), int(phase)))
+        except Exception as exc:  # noqa: BLE001 - never fail a conversion here
+            self._log_info(f"inference_status unreadable ({exc}); no intervention column")
+            return []
+        phases.sort(key=lambda item: item[0])
+        return phases
+
+    def _read_leader_sync_state(self, reader) -> Dict[str, List[Tuple[float, int]]]:
+        """Collect (log_time_sec, time_from_start_ns) per leader action topic.
+
+        See a2_joint_trajectory_command_broadcaster.cpp: time_from_start is
+        Duration(0,0) when joints are synced and Duration(0, delay_ns) while
+        slow-start retargeting is still converging. That gives a measured
+        handoff boundary instead of a guessed frame count.
+        """
+        topics = [t for t in (self.config.action_topics or []) if t]
+        if not topics:
+            return {}
+        out: Dict[str, List[Tuple[float, int]]] = {}
+        try:
+            for topic, msg, ts in reader.read_messages(topic_filter=topics):
+                points = getattr(msg, "points", None)
+                if not points:
+                    continue
+                tfs = getattr(points[0], "time_from_start", None)
+                if tfs is None:
+                    continue
+                ns = int(getattr(tfs, "sec", 0)) * 1_000_000_000 + int(
+                    getattr(tfs, "nanosec", 0)
+                )
+                out.setdefault(topic, []).append((float(ts), ns))
+        except Exception as exc:  # noqa: BLE001
+            self._log_info(f"leader sync state unreadable ({exc}); no handoff exclusion")
+            return {}
+        for values in out.values():
+            values.sort(key=lambda item: item[0])
+        return out
+
+    def _is_handoff_frame(
+        self,
+        frame_time: float,
+        sync_messages: Dict[str, List[Tuple[float, int]]],
+    ) -> bool:
+        """True while any leader group is still slow-start retargeting."""
+        for values in sync_messages.values():
+            times = [t for t, _ in values]
+            idx = bisect.bisect_right(times, frame_time) - 1
+            if idx >= 0 and values[idx][1] != 0:
+                return True
+        return False
+
+    TELEOP_STATUS_TOPIC = "/leader/teleoperation/control_status"
+
+    def _read_teleop_active_arms(self, reader) -> List[Tuple[float, str]]:
+        """Collect (log_time_sec, active_arms) from the teleop status topic."""
+        out: List[Tuple[float, str]] = []
+        try:
+            for topic, msg, ts in reader.read_messages(
+                topic_filter=[self.TELEOP_STATUS_TOPIC]
+            ):
+                if topic != self.TELEOP_STATUS_TOPIC:
+                    continue
+                arms = getattr(msg, "active_arms", None)
+                if arms is None:
+                    continue
+                out.append((float(ts), str(arms)))
+        except Exception as exc:  # noqa: BLE001
+            self._log_info(f"teleop status unreadable ({exc}); PAUSED alone will label human")
+            return []
+        out.sort(key=lambda item: item[0])
+        return out
+
+    def _teleop_engaged(
+        self,
+        frame_time: float,
+        arm_messages: List[Tuple[float, str]],
+    ) -> Optional[bool]:
+        """True/False if the leader was engaged; None when unknown."""
+        if not arm_messages:
+            return None
+        times = [t for t, _ in arm_messages]
+        idx = bisect.bisect_right(times, frame_time) - 1
+        if idx < 0:
+            return None
+        value = (arm_messages[idx][1] or "").strip().lower()
+        return value not in ("", "none")
+
+    def _assign_intervention_flags(self, episode_data: EpisodeData) -> None:
+        """Map inference_phase onto the frame grid by causal (previous) fill.
+
+        INFERENCING -> 0 (policy drove), PAUSED -> 1 (human drove), anything
+        else -> -1 (excluded). Frames before the first status message are -1:
+        with the publisher latched a subscriber gets the current phase on
+        connect, so a gap here means the phase genuinely was not observed and
+        guessing 0 would silently mislabel the opening segment.
+        """
+        phases = episode_data.inference_phase_messages
+        length = int(episode_data.length or 0)
+        if not phases or length <= 0:
+            episode_data.intervention_flags = []
+            return
+
+        grid = episode_data.grid_log_times_sec[:length]
+        if len(grid) != length:
+            self._log_info(
+                "grid_log_times_sec missing/short; skipping intervention column"
+            )
+            episode_data.intervention_flags = []
+            return
+
+        times = [t for t, _ in phases]
+        sync_messages = episode_data.leader_sync_messages or {}
+        arm_messages = episode_data.teleop_active_arms_messages or []
+        flags: List[int] = []
+        for frame_time in grid:
+            idx = bisect.bisect_right(times, frame_time) - 1
+            if idx < 0:
+                flags.append(-1)
+                continue
+            phase = phases[idx][1]
+            if phase == self._PHASE_INFERENCING:
+                flags.append(0)
+            elif phase == self._PHASE_PAUSED:
+                # PAUSED means the human has control -- but the first stretch
+                # after PAUSE is the leader slow-start retargeting onto the
+                # follower, which is machine motion. Exclude it, or every
+                # takeover trains on a sweep toward the follower's pose.
+                engaged = self._teleop_engaged(frame_time, arm_messages)
+                if self._is_handoff_frame(frame_time, sync_messages):
+                    flags.append(-1)
+                elif engaged is False:
+                    # Policy paused but the leader is not engaged -- nobody is
+                    # driving. Excluded, never labelled as human intervention.
+                    flags.append(-1)
+                else:
+                    flags.append(1)
+            else:
+                flags.append(-1)
+
+        episode_data.intervention_flags = flags
+        episode_data.n_intervention = sum(1 for f in flags if f == 1)
+        episode_data.n_auto = sum(1 for f in flags if f == 0)
+        self._log_info(
+            f"episode {episode_data.episode_index}: intervention frames "
+            f"{episode_data.n_intervention}, autonomous {episode_data.n_auto}, "
+            f"excluded {sum(1 for f in flags if f == -1)} "
+            f"(handoff/slow-start included in excluded)"
+        )
+
+    def _hard_stage_frame_mask(self, episode_data: EpisodeData) -> List[bool]:
+        """True for frames whose subtask instruction names a hard stage.
+
+        See _HARD_STAGE_KEYWORDS. Returns all-False (no boost) when subtask
+        indices aren't available -- e.g. single-subtask recordings with no
+        instruction text to match against.
+        """
+        length = int(episode_data.length or 0)
+        indices = episode_data.subtask_indices
+        instructions = episode_data.subtask_instructions
+        if not indices or len(indices) != length or not instructions:
+            return [False] * length
+        hard_by_index = {
+            idx: any(kw in instr.lower() for kw in self._HARD_STAGE_KEYWORDS)
+            for idx, instr in enumerate(instructions)
+        }
+        return [hard_by_index.get(idx, False) for idx in indices]
+
+    def _assign_sample_weights(self, episode_data: EpisodeData) -> None:
+        """Reproduce Larchenko's real-robot DAgger sampling weight (Figure 17).
+
+        Three tiers, by intervention_flags: human-correction frames
+        (flags=1) get the highest weight; autonomous frames (flags=0) sit
+        at a low baseline since the policy is mostly just doing fine on
+        its own; autonomous frames in the _PRE_PAUSE_RAMP_SECONDS window
+        immediately before a takeover ramp from that baseline down to
+        zero, so we don't reinforce the exact moves that led into the
+        takeover. Excluded frames (flags=-1, e.g. handoff/slow-start) are
+        left at a neutral 1.0 -- they're already dropped elsewhere via
+        intervention=-1, sample_weight doesn't do that job.
+
+        This is the paper's crude hand-tuned scheme, explicitly offered
+        as a substitute for real advantage/value-based weighting -- see
+        EpisodeData.sample_weight for that distinction.
+        """
+        flags = episode_data.intervention_flags
+        length = int(episode_data.length or 0)
+        if not flags or length <= 0:
+            episode_data.sample_weight = []
+            return
+        grid = episode_data.grid_log_times_sec[:length]
+        if len(grid) != length:
+            episode_data.sample_weight = [1.0] * length
+            return
+
+        phases = episode_data.inference_phase_messages
+        pause_onsets = sorted(
+            t for i, (t, p) in enumerate(phases)
+            if p == self._PHASE_PAUSED
+            and (i == 0 or phases[i - 1][1] != self._PHASE_PAUSED)
+        )
+
+        weights = [1.0] * length
+        hard_stage = self._hard_stage_frame_mask(episode_data)
+        for i, flag in enumerate(flags):
+            if flag == 1:
+                weights[i] = (
+                    self._HARD_STAGE_HUMAN_WEIGHT
+                    if hard_stage[i]
+                    else self._HUMAN_SAMPLE_WEIGHT
+                )
+            elif flag == 0:
+                weights[i] = self._AUTONOMOUS_BASELINE_WEIGHT
+
+        if pause_onsets:
+            for i, frame_time in enumerate(grid):
+                if flags[i] != 0:
+                    continue  # only autonomous frames are ramped
+                idx = bisect.bisect_left(pause_onsets, frame_time)
+                if idx >= len(pause_onsets):
+                    continue  # no pause after this frame -- nothing to ramp toward
+                gap = pause_onsets[idx] - frame_time
+                if gap < self._PRE_PAUSE_RAMP_SECONDS:
+                    weights[i] = self._AUTONOMOUS_BASELINE_WEIGHT * max(
+                        0.0, gap / self._PRE_PAUSE_RAMP_SECONDS
+                    )
+        episode_data.sample_weight = weights
+
+        ramped = sum(
+            1 for i, w in enumerate(weights)
+            if flags[i] == 0 and w < self._AUTONOMOUS_BASELINE_WEIGHT
+        )
+        human = sum(1 for f in flags if f == 1)
+        human_hard = sum(1 for i, f in enumerate(flags) if f == 1 and hard_stage[i])
+        if ramped or human:
+            self._log_info(
+                f"episode {episode_data.episode_index}: sample_weight -- "
+                f"{human - human_hard} human frames at {self._HUMAN_SAMPLE_WEIGHT}, "
+                f"{human_hard} human frames in a hard stage (driver/screw) at "
+                f"{self._HARD_STAGE_HUMAN_WEIGHT}, "
+                f"{ramped} autonomous frames ramped toward zero in the "
+                f"{self._PRE_PAUSE_RAMP_SECONDS:.0f}s before a takeover, "
+                f"rest at baseline {self._AUTONOMOUS_BASELINE_WEIGHT}"
+            )
+
+    def _relabel_action_from_follower_lead(self, episode_data: EpisodeData) -> None:
+        """Overwrite action[t] with the follower's own state at t+lead_frames.
+
+        action is recorded from the leader topics, state from the follower.
+        Whenever an arm is disengaged (deliberately, e.g. holding one arm
+        static for camera framing, or via an operator clutch), the follower
+        holds still while the leader keeps free-wheeling in the operator's
+        hand -- and the teleop mode re-references on re-engage rather than
+        snapping the follower to match, so the two never resync. Every frame
+        after the first disengage trains the model to predict a leader-frame
+        target the follower cannot reach: measured on episode 32 of
+        screwing35_subtask, the leader/follower gap is 0.3mm before the
+        first disengage and 157mm by the driver grasp.
+
+        action[t] = state[t+lead_frames] is reachable by construction --
+        it's a real pose the follower itself will actually occupy -- and
+        during a disengage it correctly reads "hold still" instead of
+        commanding the leader's free motion. lead_frames=5 (167ms) is not a
+        tuned hyperparameter: it's the median leader->follower tracking lag
+        measured independently on pre-disengage motion, consistent across
+        35 demonstration episodes. See hil_dagger/eval/lead_time_sweep.py
+        (robot_aiworker) for the validation this default is based on.
+
+        Off by default: this redefines what `action` means for every
+        dataset this converter produces, so it must be opted into per
+        conversion via ConversionConfig.relabel_action_to_follower_lead,
+        not silently changed for existing pipelines.
+        """
+        if not self.config.relabel_action_to_follower_lead:
+            return
+        length = int(episode_data.length or 0)
+        state = episode_data.observation_state
+        if length <= 0 or len(state) != length:
+            return
+        lead = max(1, int(self.config.action_lead_frames))
+        last = length - 1
+        episode_data.action = [state[min(i + lead, last)] for i in range(length)]
+        self._log_info(
+            f"episode {episode_data.episode_index}: action relabeled to "
+            f"follower state at t+{lead} frames ({lead / self.config.fps * 1000:.0f}ms lead)"
+        )
+
+    def _assign_reward_and_done(self, episode_data: EpisodeData) -> None:
+        """Sparse reward + terminal flag for HIL-SERL.
+
+        reward is 1 from ``success_frame`` onward when outcome is SUCCESS, else
+        0 everywhere. done marks only the final frame.
+        """
+        length = int(episode_data.length or 0)
+        if length <= 0:
+            episode_data.rewards = []
+            episode_data.dones = []
+            return
+
+        rewards = [0] * length
+        if (episode_data.outcome or "").upper() == "SUCCESS":
+            start = episode_data.success_frame
+            start = 0 if start is None else max(0, min(int(start), length - 1))
+            for i in range(start, length):
+                rewards[i] = 1
+
+        dones = [False] * length
+        dones[-1] = True
+        episode_data.rewards = rewards
+        episode_data.dones = dones
 
     def _assign_subtask_indices(self, episode_data: EpisodeData) -> None:
         """Map each output row timestamp to its source subtask segment."""
@@ -2816,6 +3234,11 @@ class RosbagToLerobotConverterBase:
             return None
 
         episode = EpisodeData(episode_index=episode_index)
+        # Read the inference-phase stream up front while the reader is open.
+        # Cheap: the topic is one-shot on transitions, not periodic.
+        episode.inference_phase_messages = self._read_inference_phases(reader)
+        episode.leader_sync_messages = self._read_leader_sync_state(reader)
+        episode.teleop_active_arms_messages = self._read_teleop_active_arms(reader)
 
         # Determine time bounds from trim points
         trim_start = (
@@ -4997,6 +5420,30 @@ class RosbagToLerobotConverterBase:
         if any(ep.subtask_indices for ep in episodes_data):
             self._features["subtask_index"] = {
                 "dtype": "int64",
+                "shape": (1,),
+                "names": None,
+            }
+        # Online-RL columns. Emitted only when /task/inference_status was
+        # actually recorded -- see EpisodeData.intervention_flags for why an
+        # all-zero fallback would be worse than no column at all.
+        if any(ep.intervention_flags for ep in episodes_data):
+            self._features["intervention"] = {
+                "dtype": "int64",
+                "shape": (1,),
+                "names": None,
+            }
+            self._features["reward"] = {
+                "dtype": "int64",
+                "shape": (1,),
+                "names": None,
+            }
+            self._features["done"] = {
+                "dtype": "bool",
+                "shape": (1,),
+                "names": None,
+            }
+            self._features["sample_weight"] = {
+                "dtype": "float32",
                 "shape": (1,),
                 "names": None,
             }

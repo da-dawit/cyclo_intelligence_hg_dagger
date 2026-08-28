@@ -285,6 +285,42 @@ services:
       - LOAD_POLICY_TIMEOUT_S=${LOAD_POLICY_TIMEOUT_S:-7200}
       - CMD_VEL_LINEAR_DEADBAND=0.02
       - CMD_VEL_ANGULAR_DEADBAND=0.02
+      # SG2 drives the arms only. head/lift/mobile were frozen at their init
+      # pose throughout recording, so commanding them just fights the holding
+      # controllers. RobotClient still consumes their slice of the action
+      # vector (keeping later offsets aligned) but never publishes it.
+      - FROZEN_ACTION_MODALITIES=head,lift,mobile
+      # BLEND_DURATION_S=0.2 (the ActionChunkProcessor default) was tuned
+      # against the old 40-step-horizon model's ~2.67s chunks. This model's
+      # 16-step/~1.07s chunks hit refill much faster, so the same fixed
+      # blend window was eating ~40% of what actually executes per chunk
+      # instead of ~7-8% -- scaled down to preserve that ratio.
+      - BLEND_DURATION_S=0.08
+      # CHUNK_ALIGN_WINDOW_S=0.3 (default) let l2_align search up to ~4-5
+      # samples past expected_idx. With this model's chunks, best_idx kept
+      # landing at that far edge, so start_idx=best_idx+1 discarded 75-90%
+      # of every fresh 16-step chunk (produced=13-30 raw steps out of a
+      # possible ~100) -- the buffer starved between refills and net reach
+      # fell short. Narrowed so the search can't drift that far past
+      # expected_idx in the first place.
+      - CHUNK_ALIGN_WINDOW_S=0.1
+      # dawity/groot_screwing35 16d_30k checkpoint was trained with a square
+      # crop instead of letterboxing (crop_to_square.patch, applied to the
+      # vendored Isaac-GR00T's image_augmentations.py) -- head keeps its full
+      # FOV, both wrists crop to their bottom 240x240 (the ceiling was 88% of
+      # frame at grasp). Without this the checkpoint sees an input
+      # distribution it never trained on, silently, with no error.
+      - GR00T_SQUARE_CROP=1
+      - GR00T_ROI_JSON=/workspace/config/roi_hybrid.json
+      # Re-enabled 2026-08-28 after robot_client.py's _apply_gripper_hold
+      # was fixed to require sustained effort over a dwell window (below),
+      # not a single sample -- the first attempt at 250 froze on a brief
+      # closing-motion transient before the jaws were narrow enough to catch
+      # a thin bolt. 250 is still the threshold measured from the real
+      # sustained-contact signature (~660 held for ~5s); the dwell is what
+      # was actually missing, not the threshold value.
+      - GRIPPER_HOLD_EFFORT_THRESHOLD=400
+      - GRIPPER_HOLD_DWELL_S=0.2
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=all
       - PYTHONUNBUFFERED=1

@@ -58,6 +58,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -724,6 +725,8 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
                     'selected_action_topics': list(self.config.selected_action_topics),
                     'selected_joints': list(self.config.selected_joints),
                     'source_rosbags': list(self.config.source_rosbags),
+                    'relabel_action_to_follower_lead': self.config.relabel_action_to_follower_lead,
+                    'action_lead_frames': self.config.action_lead_frames,
                 }
                 max_workers = _resolve_conversion_worker_count(len(missing_bag_paths))
                 self._log_info(
@@ -902,6 +905,11 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
             ),
             "action": self._array_cache_signature(episode.action),
             "subtask_indices": self._array_cache_signature(episode.subtask_indices),
+            "intervention_flags": self._array_cache_signature(
+                episode.intervention_flags
+            ),
+            "outcome": str(episode.outcome or ""),
+            "success_frame": episode.success_frame,
             "video_files": video_files,
         }
 
@@ -1470,6 +1478,15 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
         ]
         if has_subtask_feature:
             schema_fields.append(pa.field("subtask_index", pa.int64()))
+        # Online-RL columns, present only when /task/inference_status was in
+        # the bag. Computed locally from `episodes` so no extra parameter has
+        # to be threaded through the five has_subtask_feature call sites.
+        has_hil_feature = any(ep.intervention_flags for ep in episodes)
+        if has_hil_feature:
+            schema_fields.append(pa.field("intervention", pa.int64()))
+            schema_fields.append(pa.field("reward", pa.int64()))
+            schema_fields.append(pa.field("done", pa.bool_()))
+            schema_fields.append(pa.field("sample_weight", pa.float32()))
         if state_dim > 0:
             schema_fields.append(
                 pa.field("observation.state", pa.list_(pa.float32(), state_dim))
@@ -1483,6 +1500,14 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
         task_index = np.empty(num_frames, dtype=np.int64)
         subtask_index = (
             np.empty(num_frames, dtype=np.int64) if has_subtask_feature else None
+        )
+        intervention = (
+            np.empty(num_frames, dtype=np.int64) if has_hil_feature else None
+        )
+        reward = np.empty(num_frames, dtype=np.int64) if has_hil_feature else None
+        done = np.empty(num_frames, dtype=bool) if has_hil_feature else None
+        sample_weight = (
+            np.empty(num_frames, dtype=np.float32) if has_hil_feature else None
         )
         state_values = (
             np.empty((num_frames, state_dim), dtype=np.float32)
@@ -1513,6 +1538,30 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
                     )
                 else:
                     subtask_index[offset:end] = 0
+            if intervention is not None:
+                if len(episode.intervention_flags) == length:
+                    intervention[offset:end] = np.asarray(
+                        episode.intervention_flags, dtype=np.int64
+                    )
+                else:
+                    # -1 (excluded), never 0: an episode with no phase stream
+                    # is unlabelled, not autonomous.
+                    intervention[offset:end] = -1
+                if len(episode.rewards) == length:
+                    reward[offset:end] = np.asarray(episode.rewards, dtype=np.int64)
+                else:
+                    reward[offset:end] = 0
+                if len(episode.dones) == length:
+                    done[offset:end] = np.asarray(episode.dones, dtype=bool)
+                else:
+                    done[offset:end] = False
+                    done[end - 1] = True
+                if len(episode.sample_weight) == length:
+                    sample_weight[offset:end] = np.asarray(
+                        episode.sample_weight, dtype=np.float32
+                    )
+                else:
+                    sample_weight[offset:end] = 1.0
             if state_values is not None:
                 state_values[offset:end] = np.asarray(
                     episode.observation_state[:length],
@@ -1541,6 +1590,11 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
         ]
         if subtask_index is not None:
             arrays.append(pa.array(subtask_index, type=pa.int64()))
+        if intervention is not None:
+            arrays.append(pa.array(intervention, type=pa.int64()))
+            arrays.append(pa.array(reward, type=pa.int64()))
+            arrays.append(pa.array(done, type=pa.bool_()))
+            arrays.append(pa.array(sample_weight, type=pa.float32()))
         if state_values is not None:
             state_flat = pa.array(state_values.reshape(-1), type=pa.float32())
             arrays.append(pa.FixedSizeListArray.from_arrays(state_flat, state_dim))
@@ -1552,6 +1606,7 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
             has_subtask_feature,
             state_dim,
             action_dim,
+            has_hil_feature=has_hil_feature,
         )
         schema = pa.schema(schema_fields).with_metadata(
             {"huggingface": hf_metadata}
@@ -1569,6 +1624,7 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
         has_subtask_feature: bool,
         state_dim: int,
         action_dim: int,
+        has_hil_feature: bool = False,
     ) -> str:
         hf_features = {
             "timestamp": {"dtype": "float32", "_type": "Value"},
@@ -1579,6 +1635,11 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
         }
         if has_subtask_feature:
             hf_features["subtask_index"] = {"dtype": "int64", "_type": "Value"}
+        if has_hil_feature:
+            hf_features["intervention"] = {"dtype": "int64", "_type": "Value"}
+            hf_features["reward"] = {"dtype": "int64", "_type": "Value"}
+            hf_features["done"] = {"dtype": "bool", "_type": "Value"}
+            hf_features["sample_weight"] = {"dtype": "float32", "_type": "Value"}
         if state_dim > 0:
             hf_features["observation.state"] = {
                 "feature": {"dtype": "float32", "_type": "Value"},
@@ -4093,7 +4154,24 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
             self._log_info("Reused v3 tasks parquet cache")
             return
 
-        table = pa.Table.from_pylist(tasks_data)
+        # Readers expect the task STRING as the row index, not a plain
+        # column -- Isaac-GR00T's convert_v3_to_v2.py does
+        # `for task, row in tasks.iterrows(): ... "task": task`, using
+        # iterrows()'s index as the task string. Writing task as an
+        # ordinary column (pa.Table.from_pylist, the old behaviour) left
+        # readers pulling the default range index ("0", "1", ...) as the
+        # task/language string instead of the real instruction -- silent,
+        # since nothing errors, but the model was trained on garbage
+        # language conditioning.
+        # Row POSITION must equal task_index, not just "task is the index" --
+        # our trainer (robot_omy/lerobot dataset_reader.py) looks up by
+        # position: self._meta.tasks.iloc[task_idx].name. _collect_tasks
+        # assigns idx=len(self._tasks) sequentially so tasks_data is already
+        # in task_index order for a single conversion, but this sort makes
+        # that an invariant rather than an assumption -- cheap, and it's the
+        # one thing a merged/re-indexed source could silently violate.
+        df = pd.DataFrame(tasks_data).sort_values("task_index").set_index("task")
+        table = pa.Table.from_pandas(df)
         pq.write_table(table, file_path, **_v30_parquet_write_kwargs())
         if cache_key is not None:
             self._store_small_parquet_cache(

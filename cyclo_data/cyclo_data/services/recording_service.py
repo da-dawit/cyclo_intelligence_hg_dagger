@@ -266,6 +266,43 @@ class RecordingService:
         with self._session_lock:
             self._robot_type = robot_type
             existing = self._data_manager
+            # 'inference' recordings (online-RL/HG-DAgger) mint a brand new
+            # timestamp on every _make_save_repo_name call by design (its
+            # task_name is always the literal 'inference', so nothing in the
+            # normal name-comparison below can recognise "same session").
+            # is_recording() alone used to be the only thing keeping a
+            # multi-episode session in one folder, and it stops working the
+            # instant recording pauses between episodes -- every "next
+            # episode" minted its own new Task_<timestamp>_inference_MCAP
+            # folder with a single episode 0 inside. _clear_data_manager()
+            # has no callers anywhere in this package, so there is currently
+            # no code path that ever intentionally ends an inference
+            # session -- as long as one exists for this task_type, it's
+            # meant to keep being reused regardless of momentary recording
+            # state, matching how the UI actually wants "one directory,
+            # many episodes" to work.
+            existing_task_type = (
+                getattr(getattr(existing, '_task_info', None), 'task_type', '') or ''
+            ) if existing is not None else ''
+            incoming_task_type = getattr(task_info, 'task_type', '') or ''
+            if (
+                existing is not None
+                and incoming_task_type == 'inference'
+                and existing_task_type == 'inference'
+            ):
+                # update_task_info() replaces _task_info wholesale, but the
+                # incoming task_info here is a fresh per-episode request that
+                # never carries task_num/task_name -- those are only ever
+                # assigned once, by _make_save_repo_name() at session
+                # creation. Without re-stamping them, every episode after the
+                # first silently blanks the session's own identity, which is
+                # what the status topic (and outcome-save's bag_path lookup)
+                # reads.
+                existing_info = getattr(existing, '_task_info', None)
+                task_info.task_num = getattr(existing_info, 'task_num', '') or ''
+                task_info.task_name = getattr(existing_info, 'task_name', '') or ''
+                existing.update_task_info(task_info)
+                return existing
             if existing is not None and existing.is_recording():
                 return existing
         save_repo_name = DataManager._make_save_repo_name(

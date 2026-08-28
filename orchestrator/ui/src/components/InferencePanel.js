@@ -33,6 +33,10 @@ import PolicyBackendControl from './PolicyBackendControl';
 import TrtEngineControl from './TrtEngineControl';
 import Tooltip from './Tooltip';
 import { InferencePhase } from '../constants/taskPhases';
+import {
+  TASK_INSTRUCTION_GROUPS,
+  TASK_INSTRUCTION_VALUES,
+} from '../constants/taskInstructionPresets';
 import { DEFAULT_PATHS } from '../constants/paths';
 import {
   markLocalTaskInfoEdited,
@@ -462,6 +466,32 @@ const InferencePanel = () => {
           Whitelist lives in constants/policyCapabilities.js. */}
       {showInstruction && (
         <>
+          <div className={clsx('flex', 'items-center', 'mb-1')}>
+            <span className={classLabel}>Preset</span>
+            <select
+              className={classTextInput}
+              value={
+                TASK_INSTRUCTION_VALUES.has(currentInstruction)
+                  ? currentInstruction
+                  : ''
+              }
+              onChange={(e) => {
+                const v = e.target.value;
+                if (v) handleChange('taskInstruction', [v]);
+              }}
+            >
+              <option value="">Custom…</option>
+              {TASK_INSTRUCTION_GROUPS.map((g) => (
+                <optgroup key={g.label} label={g.label}>
+                  {g.options.map((o) => (
+                    <option key={o.value} value={o.value}>
+                      {o.label}
+                    </option>
+                  ))}
+                </optgroup>
+              ))}
+            </select>
+          </div>
           <div className={clsx('flex', 'items-start', 'mb-1')}>
             <span className={clsx(classLabel, 'pt-2')}>Task Instruction</span>
             <textarea

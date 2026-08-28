@@ -214,6 +214,20 @@ class RobotClient:
         self._command_msg_types: dict[str, str] = {}
         self._command_joint_names: dict[str, list[str]] = {}
         self._action_keys = sorted(self._action_groups.keys())
+        # Modalities that must never be commanded, regardless of what the policy
+        # emits, e.g. FROZEN_ACTION_MODALITIES=head,lift,mobile. The slice is
+        # still consumed from the action vector so later offsets stay aligned;
+        # only the publish is suppressed. Empty by default -> no behaviour change.
+        self._frozen_action_modalities = {
+            m.strip()
+            for m in os.environ.get("FROZEN_ACTION_MODALITIES", "").split(",")
+            if m.strip()
+        }
+        if self._frozen_action_modalities:
+            logger.info(
+                "frozen action modalities (never commanded): %s",
+                ", ".join(sorted(self._frozen_action_modalities)),
+            )
         self._cmd_vel_linear_deadband = max(
             0.0,
             _float_env("CMD_VEL_LINEAR_DEADBAND", 0.0),
@@ -222,6 +236,67 @@ class RobotClient:
             0.0,
             _float_env("CMD_VEL_ANGULAR_DEADBAND", 0.0),
         )
+        # Per-tick rate limit on published joint positions, independent of
+        # seed_anchor's start-of-chunk smoothing in ActionChunkProcessor.
+        # seed_anchor prevents a positional JUMP (the chunk ramps from the
+        # robot's actual pose instead of the policy's raw first prediction)
+        # but does not bound how FAST that ramp is -- BLEND_DURATION_S is a
+        # fixed 0.2s window, so a large distance (e.g. resuming after the
+        # human moved the arm a long way during an extended teleop
+        # intervention) still gets crammed into 0.2s, which reads as a
+        # sudden lunge even though it is technically continuous. This is a
+        # hard cap on top of that, applied per joint group at the actual
+        # publish point so it catches every source of a large step, not
+        # just the ones the blend logic anticipates. Default matches
+        # cyclo_teleoperation's own max_joint_velocity for mode 2 teleop
+        # (ffw_a2_teleoperation.yaml) -- same limit, same reasoning, now
+        # applied on the auto side too.
+        self._max_joint_velocity_rad_s = max(
+            0.0,
+            _float_env("MAX_JOINT_VELOCITY_RAD_S", 1.5),
+        )
+        self._last_published_positions: dict[str, tuple[np.ndarray, float]] = {}
+
+        # Freeze the gripper once measured grip effort crosses a threshold,
+        # instead of continuing to follow the policy's raw commanded
+        # position. The policy grasps reliably but keeps commanding "more
+        # closed" past the point contact is already made -- a strong,
+        # unnecessary grip. Effort-based rather than position-based: only
+        # measured force can tell a firm grip on a small object from a loose
+        # one on a large object, a fixed closure fraction can't. 0 (default)
+        # disables this -- no behaviour change unless explicitly set. Units
+        # match get_joint_efforts()/Present Current, so the right value has
+        # to be read off real grasp attempts on this hardware, not guessed.
+        self._gripper_hold_effort_threshold = max(
+            0.0,
+            _float_env("GRIPPER_HOLD_EFFORT_THRESHOLD", 0.0),
+        )
+        # How far the policy's own commanded position has to move away from
+        # the frozen one before the hold releases and it resumes following
+        # the policy -- covers an intentional release (opening) without
+        # needing to know this robot's open/close sign convention, and also
+        # resets if the policy pushes hard for more closure than the hold
+        # allowed.
+        self._gripper_hold_release_margin = max(
+            0.0,
+            _float_env("GRIPPER_HOLD_RELEASE_MARGIN", 0.15),
+        )
+        # A single sample over threshold is not enough to freeze on -- Present
+        # Current can transiently spike from ordinary closing-motion current
+        # (acceleration, stiction) well before the jaws are actually narrow
+        # enough to contact a thin object, which froze a real grasp too early
+        # the first time this was tried. The signature that WAS confirmed
+        # real (a captured grasp) held ~660 continuously for ~5s, nothing
+        # like a brief spike -- so require the effort to stay >= threshold
+        # continuously for this long before committing to a hold, and reset
+        # the moment it dips back down.
+        self._gripper_hold_dwell_s = max(
+            0.0,
+            _float_env("GRIPPER_HOLD_DWELL_S", 0.2),
+        )
+        self._gripper_hold_state: dict[str, tuple[float, bool]] = {}
+        self._gripper_effort_above_since: dict[str, float] = {}
+
         self._closed = False
 
         self._init_subscriptions()
@@ -600,6 +675,8 @@ class RobotClient:
             width = 3 if msg_type == "geometry_msgs/msg/Twist" else len(cfg["joint_names"])
             segment = values[offset:offset + width]
             offset += width
+            if publish_key in self._frozen_action_modalities:
+                continue
 
             publisher = self._command_publishers.get(publisher_key)
             if publisher is None:
@@ -607,11 +684,135 @@ class RobotClient:
             if msg_type == "geometry_msgs/msg/Twist":
                 self._publish_twist(publisher, segment)
             else:
+                segment = self._clamp_joint_velocity(publish_key, segment)
+                segment = self._apply_gripper_hold(publish_key, segment)
                 self._publish_joint_trajectory(
                     publisher,
                     self._command_joint_names.get(publisher_key, []),
                     segment,
                 )
+
+    # A real control tick is a few tens of ms apart at most. A gap wider
+    # than this means something interrupted the stream between publishes
+    # (pause -> teleop -> resume being the main case) -- in that window the
+    # follower moved for reasons this clamp never saw, so last_values is
+    # stale and dt is not a tick period, it is however long the interruption
+    # lasted. Treating it as a normal tick would compute
+    # max_step = velocity_limit * dt over a multi-second gap, which is no
+    # limit at all -- the exact opposite of what this clamp exists for.
+    _STALE_GAP_S = 0.5
+
+    def _seed_from_real_position(self, key: str, values: np.ndarray, now: float) -> np.ndarray:
+        """Reset this group's clamp reference to the follower's live position.
+
+        Used both for a group's very first publish and for any publish that
+        follows a stale gap (see _STALE_GAP_S) -- in both cases there is no
+        trustworthy last_values to clamp against, so ground the clamp in
+        reality again instead of extrapolating from something stale.
+        """
+        real = self.get_joint_positions(f"follower_{key}")
+        if real is not None and real.size == values.size:
+            start = np.asarray(real, dtype=np.float64)
+            self._last_published_positions[key] = (start.copy(), now)
+            return start
+        self._last_published_positions[key] = (values.copy(), now)
+        return values
+
+    def _clamp_joint_velocity(self, key: str, values: np.ndarray) -> np.ndarray:
+        """Cap this group's per-tick position delta to max_joint_velocity_rad_s.
+
+        Keyed per action group (arm_left/arm_right/...) so groups do not
+        interfere with each other's timing. Deliberately NOT applied to
+        publish_action_preview's call into _publish_joint_trajectory -- the
+        3D preview should show the policy's raw predicted trajectory, not a
+        rate-limited one.
+        """
+        now = time.monotonic()
+        last = self._last_published_positions.get(key)
+        if last is None:
+            # No prior publish to measure a dt against, so this group's
+            # very first tick can't be rate-limited the normal way -- but
+            # that used to mean it passed straight through unclamped,
+            # relying entirely on seed_anchor (in ActionChunkProcessor,
+            # upstream) to have already made this first value safe. If
+            # seed_anchor ever doesn't fire in time, that first value is
+            # the sudden lunge seen at the start of a rollout, and it slips
+            # past this clamp too. Instead: hold at the follower's actual
+            # current position for this one tick (zero jump, guaranteed,
+            # no dt assumption needed) and seed the reference from there --
+            # every tick from the second one onward then ramps toward the
+            # real target at the normal velocity limit.
+            return self._seed_from_real_position(key, values, now)
+        last_values, last_time = last
+        if last_values.shape != values.shape:
+            return self._seed_from_real_position(key, values, now)
+        dt = max(0.0, now - last_time)
+        if dt > self._STALE_GAP_S:
+            return self._seed_from_real_position(key, values, now)
+        max_step = self._max_joint_velocity_rad_s * dt
+        clamped = last_values + np.clip(values - last_values, -max_step, max_step)
+        self._last_published_positions[key] = (clamped.copy(), now)
+        return clamped
+
+    def _gripper_index(self, publish_key: str) -> Optional[int]:
+        names = self._action_groups.get(publish_key, {}).get("joint_names", [])
+        for i, name in enumerate(names):
+            if name.startswith("gripper_"):
+                return i
+        return None
+
+    def _apply_gripper_hold(self, publish_key: str, segment: np.ndarray) -> np.ndarray:
+        """Override the gripper's commanded position with a held one once
+        measured grip effort has stayed >= GRIPPER_HOLD_EFFORT_THRESHOLD
+        continuously for GRIPPER_HOLD_DWELL_S.
+
+        See the threshold's and dwell's own comments in __init__ for why
+        this is effort-, not position-, based, and why a single sample over
+        threshold does not commit to a hold.
+        """
+        if self._gripper_hold_effort_threshold <= 0.0:
+            return segment
+        idx = self._gripper_index(publish_key)
+        if idx is None or idx >= len(segment):
+            return segment
+
+        held_position, is_holding = self._gripper_hold_state.get(
+            publish_key, (0.0, False)
+        )
+        commanded = float(segment[idx])
+
+        if is_holding:
+            if abs(commanded - held_position) > self._gripper_hold_release_margin:
+                is_holding = False
+                self._gripper_effort_above_since.pop(publish_key, None)
+            else:
+                segment = segment.copy()
+                segment[idx] = held_position
+
+        if not is_holding:
+            efforts = self.get_joint_efforts(f"follower_{publish_key}")
+            measured_effort = (
+                float(efforts[idx]) if efforts is not None and idx < len(efforts) else 0.0
+            )
+            now = time.monotonic()
+            if abs(measured_effort) >= self._gripper_hold_effort_threshold:
+                since = self._gripper_effort_above_since.get(publish_key)
+                if since is None:
+                    self._gripper_effort_above_since[publish_key] = now
+                elif now - since >= self._gripper_hold_dwell_s:
+                    is_holding = True
+                    held_position = commanded
+                    segment = segment.copy()
+                    segment[idx] = held_position
+                    self._gripper_effort_above_since.pop(publish_key, None)
+            else:
+                # Dipped back below threshold before the dwell completed --
+                # that was a transient, not sustained contact. Reset so the
+                # next crossing has to prove itself again from zero.
+                self._gripper_effort_above_since.pop(publish_key, None)
+
+        self._gripper_hold_state[publish_key] = (held_position, is_holding)
+        return segment
 
     def publish_idle_action(self, action_keys: Optional[list[str]] = None) -> None:
         """Publish safe idle commands for velocity-like action topics.
@@ -655,6 +856,8 @@ class RobotClient:
             segment = values[offset:offset + width]
             offset += width
             if msg_type == "geometry_msgs/msg/Twist":
+                continue
+            if publish_key in self._frozen_action_modalities:
                 continue
             names = list(cfg.get("joint_names", []))
             joint_names.extend(names)

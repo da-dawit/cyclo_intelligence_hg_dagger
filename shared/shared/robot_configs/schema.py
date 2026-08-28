@@ -379,7 +379,13 @@ def get_visualization_end_effector_links(section: Dict[str, Any]) -> List[str]:
 def get_joystick_topics(section: Dict[str, Any]) -> Dict[str, str]:
     """Optional joystick integration topics for record triggers and UI mode."""
     joystick = section.get("joystick") or {}
+    record_triggers = joystick.get("record_triggers_enabled")
     return {
         "trigger_topic": str(joystick.get("trigger_topic") or ""),
         "mode_topic": str(joystick.get("mode_topic") or ""),
+        # On the A2 leader a single tact press BOTH toggles arm teleop engage
+        # and fires the record trigger. Set false to keep the engage toggle and
+        # drop only the recording side effect. Absent -> enabled (unchanged).
+        "record_triggers_enabled": True if record_triggers is None
+        else bool(record_triggers),
     }

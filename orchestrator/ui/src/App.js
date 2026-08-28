@@ -28,6 +28,7 @@ import InferencePage from './pages/InferencePage';
 import TrainingPage from './pages/TrainingPage';
 import EditDatasetPage from './pages/EditDatasetPage';
 import BTManagerPage from './pages/BTManagerPage';
+import OnlineRLPage from './pages/OnlineRLPage';
 import { useRosTopicSubscription } from './hooks/useRosTopicSubscription';
 import rosConnectionManager from './utils/rosConnectionManager';
 import { stopNavigation } from './utils/navigationApi';
@@ -412,6 +413,21 @@ function App() {
             <span className="mt-1 text-sm">Inference</span>
           </button>
 
+          {/* Online-RL Data page button. Sits next to Inference because the
+              operator starts the policy there, then attaches here. */}
+          <button
+            className={clsx(classPageButton, {
+              'hover:bg-gray-200 active:bg-gray-400 dark:hover:bg-slate-800 dark:active:bg-slate-700': page !== PageType.ONLINE_RL,
+              'bg-gray-300 dark:bg-slate-700': page === PageType.ONLINE_RL,
+            })}
+            onClick={() => dispatch(moveToPage(PageType.ONLINE_RL))}
+          >
+            <MdMemory size={32} className="mb-1.5" />
+            <span className="mt-1 text-center text-sm leading-tight">
+              Online-RL<br />Data
+            </span>
+          </button>
+
           {/* BT Manager page button */}
           <button
             className={clsx(classPageButton, {
@@ -464,6 +480,8 @@ function App() {
           <TrainingPage isActive={page === PageType.TRAINING} />
         ) : page === PageType.EDIT_DATASET ? (
           <EditDatasetPage isActive={page === PageType.EDIT_DATASET} />
+        ) : page === PageType.ONLINE_RL ? (
+          <OnlineRLPage isActive={page === PageType.ONLINE_RL} />
         ) : page === PageType.BT_MANAGER ? (
           <BTManagerPage isActive={page === PageType.BT_MANAGER} />
         ) : page === PageType.NAVIGATION ? (

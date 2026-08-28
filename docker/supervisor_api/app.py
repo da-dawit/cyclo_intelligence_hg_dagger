@@ -1189,6 +1189,90 @@ async def groot_trt_status(
     return _trt_status(model, engine)
 
 
+_ROSBAG_ROOT = "/workspace/rosbag2"
+_VALID_OUTCOMES = ("SUCCESS", "FAILURE", "DISCARD")
+
+
+class EpisodeOutcomeRequest(BaseModel):
+    outcome: str
+    # Either give an absolute bag_path, or task_name + episode_number and let
+    # the server resolve /workspace/rosbag2/<task>/<episode>. The UI knows the
+    # latter (recordStatus.taskName / currentEpisodeNumber) but not the path.
+    bag_path: Optional[str] = None
+    task_name: Optional[str] = None
+    episode_number: Optional[int] = None
+    success_frame: Optional[int] = None
+
+
+class EpisodeOutcomeResult(BaseModel):
+    ok: bool
+    message: str
+    episode_info_path: str
+
+
+@app.post("/recording/outcome", response_model=EpisodeOutcomeResult)
+def set_episode_outcome(req: EpisodeOutcomeRequest) -> EpisodeOutcomeResult:
+    """Merge an online-RL outcome into an episode's episode_info.json.
+
+    HG-DAgger drops non-SUCCESS episodes by default and HIL-SERL derives its
+    sparse reward from success_frame, so an episode saved without an outcome
+    is unusable by two of the three methods.
+    """
+    outcome = (req.outcome or "").strip().upper()
+    if outcome not in _VALID_OUTCOMES:
+        raise HTTPException(400, f"outcome must be one of {_VALID_OUTCOMES}")
+
+    raw_path = (req.bag_path or "").strip()
+    if not raw_path:
+        if not req.task_name or req.episode_number is None:
+            raise HTTPException(
+                400, "provide bag_path, or task_name and episode_number"
+            )
+        task = str(req.task_name).strip()
+        if not task or "/" in task or task in (".", ".."):
+            raise HTTPException(400, "invalid task_name")
+        raw_path = os.path.join(_ROSBAG_ROOT, task, str(int(req.episode_number)))
+    bag = os.path.normpath(raw_path)
+    if not os.path.isabs(bag):
+        raise HTTPException(400, "bag_path must be an absolute path")
+    root = os.path.normpath(_ROSBAG_ROOT)
+    if bag != root and not bag.startswith(root + os.sep):
+        raise HTTPException(400, f"bag_path must be under {_ROSBAG_ROOT}")
+    if not os.path.isdir(bag):
+        raise HTTPException(404, f"episode directory not found: {bag}")
+
+    info_path = os.path.join(bag, "episode_info.json")
+    data: dict = {}
+    if os.path.exists(info_path):
+        try:
+            with open(info_path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                data = loaded
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(500, f"unreadable episode_info.json: {exc}")
+
+    data["outcome"] = outcome
+    if req.success_frame is not None:
+        data["success_frame"] = int(req.success_frame)
+    else:
+        data.pop("success_frame", None)
+
+    tmp_path = info_path + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        os.replace(tmp_path, info_path)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, f"failed to write episode_info.json: {exc}")
+
+    return EpisodeOutcomeResult(
+        ok=True,
+        message=f"outcome={outcome}",
+        episode_info_path=info_path,
+    )
+
+
 @app.post("/backends/groot/trt/build", response_model=TrtEngineStatus)
 async def groot_trt_build(request: TrtBuildRequest) -> TrtEngineStatus:
     model, engine = _resolve_groot_trt_paths(
