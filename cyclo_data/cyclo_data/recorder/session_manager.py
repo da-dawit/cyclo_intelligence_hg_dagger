@@ -216,6 +216,17 @@ class DataManager:
         self._cpu_checker = CPUChecker()
         self.data_converter = DataConverter()
         self.current_instruction = self._main_task_instruction
+        # (elapsed_s, instruction) pairs for every UPDATE_INSTRUCTION that
+        # arrives while this episode is actively recording. update_task_info()
+        # previously just overwrote _main_task_instruction in place, so a
+        # continuous online-RL take that changed instruction mid-episode
+        # (e.g. one recording covering grab -> place -> screw -> home) ended
+        # up with every frame labelled whatever the LAST instruction was --
+        # there was no record of *when* it changed. Written into
+        # episode_info.json as 'instruction_change_log' so a later
+        # conversion pass can actually split the episode into correctly
+        # labelled segments instead of guessing from video.
+        self._instruction_change_log: list = []
         self._init_task_limits()
         self._current_scenario_number = self._current_subtask_index
         # Last README content written for this task. Cached so the
@@ -549,6 +560,16 @@ class DataManager:
         with self._state_lock:
             self._status = 'recording'
             self._start_time_s = time.perf_counter()
+            # Seed with whatever instruction is already active at t=0 --
+            # update_task_info() only appends on a *change*, so without this
+            # the phase before the first UPDATE_INSTRUCTION click has no
+            # entry at all (task_instruction/sub_task_instruction end up
+            # overwritten to the LAST value by the time the episode is
+            # written, not the first).
+            self._instruction_change_log = (
+                [{'t': 0.0, 'instruction': self._main_task_instruction}]
+                if self._main_task_instruction else []
+            )
             episode = self._record_episode_count
             full_episode = self._current_full_episode_index
             subtask = self._current_subtask_index
@@ -1014,6 +1035,36 @@ class DataManager:
             })
             segment_start_s = segment_end_s
 
+        # A continuous online-RL take is exactly one physical
+        # start_recording()/stop_recording() cycle, so the loop above always
+        # produces exactly one segments_meta entry spanning the whole
+        # episode -- that's what made every frame get the same instruction
+        # (whichever was set last). instruction_change_log has the real
+        # per-instruction timestamps (see update_task_info/start_recording),
+        # so when there's more than the initial seed entry, split that one
+        # physical segment into multiple labelled sub-segments at those
+        # timestamps instead. Same dict shape the loop above already
+        # produces, so the existing converter parsing (_apply_episode_info)
+        # needs no changes -- subtask_index is assigned by list position.
+        if len(segments_meta) == 1 and len(self._instruction_change_log) > 1:
+            only = segments_meta[0]
+            seg_start, seg_end = only['frame_duration']
+            log = sorted(self._instruction_change_log, key=lambda e: e['t'])
+            split_segments = []
+            for i, entry in enumerate(log):
+                start = max(seg_start, float(entry['t']))
+                end = (
+                    float(log[i + 1]['t']) if i + 1 < len(log) else seg_end
+                )
+                if end <= start:
+                    continue
+                split_segments.append({
+                    'sub_task_instruction': entry['instruction'],
+                    'frame_duration': [start, end],
+                })
+            if split_segments:
+                segments_meta = split_segments
+
         topics_with_count = []
         for name in sorted(all_topic_counts):
             entry = all_topic_counts[name]
@@ -1065,7 +1116,12 @@ class DataManager:
         )
 
         summary = {
-            'task_instruction': self._main_task_instruction,
+            # Hardcoded overall task, distinct from the per-phase instruction
+            # (self._main_task_instruction / instruction_change_log / segments
+            # above) -- that field gets overwritten by every UPDATE_INSTRUCTION
+            # click during a phase change, so it can never hold a stable
+            # whole-task description at the same time.
+            'task_instruction': 'Screw the orange bolt into the hole using the driver.',
             'task_num': getattr(self._task_info, 'task_num', '') or '',
             'task_name': getattr(self._task_info, 'task_name', '') or '',
             'robot_type': self._robot_type,
@@ -1074,6 +1130,7 @@ class DataManager:
             'timestamp': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
             'format_version': 'robotis_v2',
             'segments': segments_meta,
+            'instruction_change_log': list(self._instruction_change_log),
             'transcoding_status': (
                 'pending' if has_transcodable_videos else 'not_required'
             ),
@@ -1325,8 +1382,24 @@ class DataManager:
         """
         previous_subtask_mode = getattr(self, '_subtask_mode', False)
         previous_segment_total = getattr(self, '_physical_segment_total', 1)
+        previous_instruction = getattr(self, '_main_task_instruction', '')
         self._task_info = task_info
         self._main_task_instruction = self._get_main_task_instruction(task_info)
+        with self._state_lock:
+            is_recording = self._status == 'recording'
+            start_time_s = self._start_time_s
+        if (
+            is_recording
+            and self._main_task_instruction
+            and self._main_task_instruction != previous_instruction
+        ):
+            elapsed_s = (
+                time.perf_counter() - start_time_s if start_time_s else 0.0
+            )
+            self._instruction_change_log.append({
+                't': round(elapsed_s, 3),
+                'instruction': self._main_task_instruction,
+            })
         self._subtask_instructions = self._get_subtask_instructions(task_info)
         self._subtask_mode = bool(self._subtask_instructions)
         self._subtask_total = len(self._subtask_instructions)

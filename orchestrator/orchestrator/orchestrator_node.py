@@ -1896,6 +1896,27 @@ class OrchestratorNode(Node):
                             request.task_info,
                             'UPDATE_INSTRUCTION',
                         )
+                        # Also tell cyclo_data's recorder about the change so
+                        # a continuous online-RL take gets a real timestamped
+                        # record of when the instruction changed (see
+                        # DataManager._instruction_change_log) -- previously
+                        # this only reconditioned the policy below, so every
+                        # frame of every episode ended up labelled with
+                        # whichever instruction was set last, regardless of
+                        # what was actually happening for most of the take.
+                        # Best-effort: a failure here must not block the
+                        # policy re-conditioning call that follows.
+                        try:
+                            self._cyclo_data.send_recording_command(
+                                command=RecordingCommand.Request.SET_TASK_INFO,
+                                task_info=request.task_info,
+                                robot_type=self.robot_type,
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            self.get_logger().warning(
+                                f'UPDATE_INSTRUCTION: failed to log instruction '
+                                f'change to recorder: {exc!r}'
+                            )
                         with self._state_lock:
                             client = self.container_service_client
                         if client is not None:

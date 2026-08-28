@@ -161,7 +161,7 @@ class RosbagToMp4Converter:
 
     def __init__(
         self,
-        fps: int = 15,
+        fps: int = 30,
         use_hardware_encoding: bool = True,
         camera_pairs: Optional[Dict[str, Tuple[str, str]]] = None,
         exclude_topics: Optional[List[str]] = None,
@@ -1411,7 +1411,7 @@ class RosbagToMp4Converter:
 def convert_dataset(
     dataset_path: str,
     output_base_path: str,
-    fps: int = 15,
+    fps: int = 30,
     use_hardware_encoding: bool = True,
     exclude_topics: Optional[List[str]] = None,
     joint_offsets: Optional[Dict[str, Dict[str, float]]] = None,
@@ -1512,7 +1512,7 @@ def main():
     )
     parser.add_argument('input_path', help='Path to episode directory or dataset')
     parser.add_argument('--output', '-o', required=True, help='Output directory')
-    parser.add_argument('--fps', type=int, default=15, help='Video frame rate (default: 15)')
+    parser.add_argument('--fps', type=int, default=30, help='Video frame rate (default: 30)')
     parser.add_argument('--no-hw', action='store_true', help='Disable hardware encoding')
     parser.add_argument('--dataset', action='store_true', help='Convert entire dataset')
     parser.add_argument(

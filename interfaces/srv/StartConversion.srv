@@ -30,8 +30,9 @@ string[] source_folders
 # rate-agnostic (sensors stream at their natural rates with timestamps
 # and the rosbag captures verbatim) — fps is purely a conversion-time
 # decision: what rate to encode MP4s at and what rate to declare in
-# the v2.1 / v3.0 info.json. 0 means 'use the default' (15) so older
-# UIs that don't yet send fps continue to work.
+# the v2.1 / v3.0 info.json. 0 means 'use the default' (30, matching
+# this robot's actual camera/inference rate) so older UIs that don't
+# yet send fps continue to work.
 uint16 fps
 
 # Output format selection. Stage 1 (rosbag → MP4) always runs because
