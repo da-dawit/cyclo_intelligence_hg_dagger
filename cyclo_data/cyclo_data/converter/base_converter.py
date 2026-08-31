@@ -393,6 +393,23 @@ class ConversionConfig:
     relabel_action_to_follower_lead: bool = False
     action_lead_frames: int = 5
 
+    # Whether _assign_intervention_flags should exclude the leader's
+    # post-engage slow-start window as "machine motion, not a correction".
+    # True (legacy default) is correct for mode-1 (AiWorkerMoveJMode,
+    # slow_start.enabled: true in ffw_a2_teleoperation.yaml), which sweeps
+    # the follower toward the leader's pose over that window. Robots whose
+    # active control mode has slow_start.enabled: false (e.g. mode 2,
+    # AiWorkerElbowUpLeaderMode -- relative-delta, nothing sweeps on
+    # engage) should set this False via robot_config, or every takeover's
+    # opening frames -- the human's actual reaction to the policy's error --
+    # get mislabelled as excluded machine motion. See IMPROVEMENTS.md
+    # Defect 2. The leader's own broadcaster (a2_joint_trajectory_command_
+    # broadcaster.cpp) always publishes the adaptive time_from_start this
+    # exclusion keys off of, regardless of which follower mode is active --
+    # only mode 1 actually consumes it for motion, so the signal is real
+    # but its meaning is mode-dependent.
+    leader_handoff_exclusion_enabled: bool = True
+
 
 @dataclass
 class EpisodeData:
@@ -903,6 +920,12 @@ class RosbagToLerobotConverterBase:
         except Exception as e:
             self._log_error(f"Failed to load robot config: {e}")
             return
+
+        teleop_cfg = section.get("teleoperation") or {}
+        if "leader_handoff_exclusion_enabled" in teleop_cfg:
+            self.config.leader_handoff_exclusion_enabled = bool(
+                teleop_cfg["leader_handoff_exclusion_enabled"]
+            )
 
         state_groups = robot_schema.get_state_groups(section)
         action_groups = robot_schema.get_action_groups(section)
@@ -1911,10 +1934,37 @@ class RosbagToLerobotConverterBase:
         return False
 
     TELEOP_STATUS_TOPIC = "/leader/teleoperation/control_status"
+    # Plain std_msgs/String mirror of ControlModeStatus.active_arms, published
+    # by leader_bridge.py. Exists because TELEOP_STATUS_TOPIC's message type
+    # (robotis_interfaces) isn't installed where service_bag_recorder runs --
+    # recording it there fails typesupport lookup and kills the whole launch
+    # group. Robots that record this string topic get a working "was the
+    # human actually engaged" check without needing robotis_interfaces at all.
+    TELEOP_ACTIVE_ARMS_STR_TOPIC = "/leader/teleoperation/active_arms_str"
 
     def _read_teleop_active_arms(self, reader) -> List[Tuple[float, str]]:
-        """Collect (log_time_sec, active_arms) from the teleop status topic."""
+        """Collect (log_time_sec, active_arms), preferring the plain-String
+        mirror topic (works everywhere) over the typed status topic (requires
+        robotis_interfaces, frequently absent -- see TELEOP_ACTIVE_ARMS_STR_TOPIC).
+        """
         out: List[Tuple[float, str]] = []
+        try:
+            for topic, msg, ts in reader.read_messages(
+                topic_filter=[self.TELEOP_ACTIVE_ARMS_STR_TOPIC]
+            ):
+                if topic != self.TELEOP_ACTIVE_ARMS_STR_TOPIC:
+                    continue
+                data = getattr(msg, "data", None)
+                if data is None:
+                    continue
+                out.append((float(ts), str(data)))
+        except Exception as exc:  # noqa: BLE001
+            self._log_info(f"active_arms_str unreadable ({exc}); trying control_status")
+            out = []
+        if out:
+            out.sort(key=lambda item: item[0])
+            return out
+
         try:
             for topic, msg, ts in reader.read_messages(
                 topic_filter=[self.TELEOP_STATUS_TOPIC]
@@ -1986,8 +2036,22 @@ class RosbagToLerobotConverterBase:
                 # after PAUSE is the leader slow-start retargeting onto the
                 # follower, which is machine motion. Exclude it, or every
                 # takeover trains on a sweep toward the follower's pose.
+                #
+                # Only true when the active control mode actually consumes
+                # the leader's adaptive time_from_start for that sweep (mode
+                # 1 / AiWorkerMoveJMode). The leader's broadcaster publishes
+                # that delay unconditionally regardless of mode, but mode 2
+                # (AiWorkerElbowUpLeaderMode, relative-delta, slow_start.
+                # enabled: false) never sweeps on engage -- the delta anchor
+                # is captured at the tact press and motion is real human
+                # correction from frame one. leader_handoff_exclusion_enabled
+                # (robot_config's teleoperation.leader_handoff_exclusion_
+                # enabled) tells us which case this robot is in.
                 engaged = self._teleop_engaged(frame_time, arm_messages)
-                if self._is_handoff_frame(frame_time, sync_messages):
+                if (
+                    self.config.leader_handoff_exclusion_enabled
+                    and self._is_handoff_frame(frame_time, sync_messages)
+                ):
                     flags.append(-1)
                 elif engaged is False:
                     # Policy paused but the leader is not engaged -- nobody is

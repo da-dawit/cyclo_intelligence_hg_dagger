@@ -116,7 +116,7 @@ _V21_DIRECT_VIDEO_CACHE_DISABLE_ENV = "CYCLO_V21_DIRECT_VIDEO_CACHE_DISABLE"
 _V21_DIRECT_VIDEO_VALIDATE_ENV = "CYCLO_V21_VALIDATE_DIRECT_VIDEO"
 _V21_CONCAT_DECODER_DISABLE_ENV = "CYCLO_V21_CONCAT_DECODER_DISABLE"
 _V21_EPISODE_PARQUET_CACHE_DISABLE_ENV = "CYCLO_V21_EPISODE_PARQUET_CACHE_DISABLE"
-_V21_EPISODE_PARQUET_CACHE_VERSION = 1
+_V21_EPISODE_PARQUET_CACHE_VERSION = 2
 _V21_SUBTASKS_PARQUET_CACHE_DISABLE_ENV = "CYCLO_V21_SUBTASKS_PARQUET_CACHE_DISABLE"
 _V21_SUBTASKS_PARQUET_CACHE_VERSION = 1
 # Keep v2.1 segment batches large enough to amortize ffmpeg startup while
@@ -1667,6 +1667,18 @@ class RosbagToLerobotConverter(RosbagToLerobotConverterBase):
                 "subtask_indices": self._array_cache_signature(
                     episode.subtask_indices
                 ),
+                # Intervention labels can change (e.g. a fix to the handoff
+                # exclusion rule in _assign_intervention_flags) without any
+                # of the fields above changing -- hash them too, or a stale
+                # cache hit would silently keep serving the old labels.
+                "intervention_flags": self._array_cache_signature(
+                    episode.intervention_flags
+                ),
+                "rewards": self._array_cache_signature(episode.rewards),
+                "dones": self._array_cache_signature(episode.dones),
+                "sample_weight": self._array_cache_signature(
+                    episode.sample_weight
+                ),
             }
         )
         return common
@@ -1677,6 +1689,7 @@ class RosbagToLerobotConverter(RosbagToLerobotConverterBase):
         *,
         global_start_index: int,
         has_subtask_feature: bool,
+        has_hil_feature: bool = False,
     ) -> Dict[str, Any]:
         default_task = episode.tasks[0] if episode.tasks else "default_task"
         return {
@@ -1689,6 +1702,7 @@ class RosbagToLerobotConverter(RosbagToLerobotConverterBase):
             "task_index": int(self._task_to_index.get(default_task, 0)),
             "task_to_index": dict(sorted(self._task_to_index.items())),
             "has_subtask_feature": bool(has_subtask_feature),
+            "has_hil_feature": bool(has_hil_feature),
             "episode": self._v21_episode_data_cache_signature(episode),
         }
 
@@ -2003,10 +2017,12 @@ class RosbagToLerobotConverter(RosbagToLerobotConverterBase):
         # Write parquet file
         parquet_path = data_chunk_dir / f"{_v21_episode_stem(ep_idx)}.parquet"
         has_subtask_feature = "subtask_index" in self._features
+        has_hil_feature = "intervention" in self._features
         parquet_cache_key = self._v21_episode_parquet_cache_key(
             episode,
             global_start_index=self._total_frames,
             has_subtask_feature=has_subtask_feature,
+            has_hil_feature=has_hil_feature,
         )
         if not self._try_reuse_v21_episode_parquet_cache(
             episode,
@@ -2101,6 +2117,16 @@ class RosbagToLerobotConverter(RosbagToLerobotConverterBase):
         has_subtask_feature = "subtask_index" in self._features
         if has_subtask_feature:
             schema_fields.append(pa.field("subtask_index", pa.int64()))
+        # Online-RL columns, present only when /task/inference_status was in
+        # the bag. Mirrors to_lerobot_v30.py's _write_data_file. Isaac-GR00T
+        # requires v2.1, so without this every HG-DAgger export loses the
+        # human/policy label and degrades to ordinary behaviour cloning.
+        has_hil_feature = "intervention" in self._features
+        if has_hil_feature:
+            schema_fields.append(pa.field("intervention", pa.int64()))
+            schema_fields.append(pa.field("reward", pa.int64()))
+            schema_fields.append(pa.field("done", pa.bool_()))
+            schema_fields.append(pa.field("sample_weight", pa.float32()))
 
         schema = pa.schema(schema_fields)
 
@@ -2148,6 +2174,35 @@ class RosbagToLerobotConverter(RosbagToLerobotConverterBase):
                 subtask_values = [0] * num_frames
             arrays.append(pa.array(subtask_values, type=pa.int64()))
 
+        if has_hil_feature:
+            if len(episode.intervention_flags) == num_frames:
+                intervention_values = [int(v) for v in episode.intervention_flags]
+            else:
+                # -1 (excluded), never 0: an episode with no phase stream is
+                # unlabelled, not autonomous.
+                intervention_values = [-1] * num_frames
+            arrays.append(pa.array(intervention_values, type=pa.int64()))
+
+            if len(episode.rewards) == num_frames:
+                reward_values = [int(v) for v in episode.rewards]
+            else:
+                reward_values = [0] * num_frames
+            arrays.append(pa.array(reward_values, type=pa.int64()))
+
+            if len(episode.dones) == num_frames:
+                done_values = [bool(v) for v in episode.dones]
+            else:
+                done_values = [False] * num_frames
+                if num_frames:
+                    done_values[-1] = True
+            arrays.append(pa.array(done_values, type=pa.bool_()))
+
+            if len(episode.sample_weight) == num_frames:
+                sample_weight_values = [float(v) for v in episode.sample_weight]
+            else:
+                sample_weight_values = [1.0] * num_frames
+            arrays.append(pa.array(sample_weight_values, type=pa.float32()))
+
         # Build HuggingFace metadata
         hf_features = {
             "index": {"dtype": "int64", "_type": "Value"},
@@ -2170,6 +2225,11 @@ class RosbagToLerobotConverter(RosbagToLerobotConverterBase):
             }
         if has_subtask_feature:
             hf_features["subtask_index"] = {"dtype": "int64", "_type": "Value"}
+        if has_hil_feature:
+            hf_features["intervention"] = {"dtype": "int64", "_type": "Value"}
+            hf_features["reward"] = {"dtype": "int64", "_type": "Value"}
+            hf_features["done"] = {"dtype": "bool", "_type": "Value"}
+            hf_features["sample_weight"] = {"dtype": "float32", "_type": "Value"}
 
         hf_metadata = json.dumps({"info": {"features": hf_features}})
 
@@ -2192,7 +2252,21 @@ class RosbagToLerobotConverter(RosbagToLerobotConverterBase):
         for key in self._features:
             if key.startswith("observation.images."):
                 ordered[key] = self._features[key]
-        for key in ("timestamp", "episode_index", "index", "task_index", "subtask_index"):
+        for key in (
+            "timestamp",
+            "episode_index",
+            "index",
+            "task_index",
+            "subtask_index",
+            # Online-RL columns (see _write_parquet's has_hil_feature block).
+            # Omitting these from info.json was the actual bug: the parquet
+            # carried the columns but tooling that reads the feature list
+            # (rather than sniffing the parquet schema) never saw them.
+            "intervention",
+            "reward",
+            "done",
+            "sample_weight",
+        ):
             if key in self._features:
                 value = dict(self._features[key])
                 if key == "timestamp":

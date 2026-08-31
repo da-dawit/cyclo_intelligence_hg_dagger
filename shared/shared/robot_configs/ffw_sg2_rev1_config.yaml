@@ -14,6 +14,20 @@ orchestrator:
         # restore joystick-driven recording.
         record_triggers_enabled: false
 
+      teleoperation:
+        # This robot's ffw_bringup/config/ffw_a2_leader/ffw_a2_teleoperation.yaml
+        # sets default_control_mode: 2 (elbow_up_leader / AiWorkerElbowUpLeaderMode,
+        # relative-delta) with slow_start.enabled: false -- nothing sweeps on
+        # engage, the delta anchor is captured at the tact press. The leader's
+        # own broadcaster (a2_joint_trajectory_command_broadcaster.cpp) still
+        # publishes an adaptive time_from_start on every engage regardless of
+        # mode, but only mode 1 (AiWorkerMoveJMode) actually consumes it to
+        # sweep the follower -- so on this robot that signal does not mean
+        # "machine motion" and must not exclude the opening frames of a
+        # takeover from the intervention label. Set true only if this robot
+        # is reconfigured to mode 1.
+        leader_handoff_exclusion_enabled: false
+
       # ────────────────────────────────────────────────────────────────
       # Observation — every signal the policy reads from the robot.
       # Recording subscribes to all topics referenced here. Inference
@@ -144,9 +158,12 @@ orchestrator:
           # including the orchestrator, after every teleop takeover. See
           # [[groot-checkpoint-is-lerobot-format]]-adjacent finding: same
           # missing-package issue as the live UI badge, different process.
-          # Fix path: record leader_bridge.py's plain std_msgs/String
-          # /leader/teleoperation/active_arms_str instead (same information,
-          # a type every environment can load) once that's wired up.
+          # Recording leader_bridge.py's plain std_msgs/String mirror
+          # instead -- same active_arms information, a type every
+          # environment can load. base_converter.py's
+          # _read_teleop_active_arms() reads this in preference to
+          # control_status.
+          - /leader/teleoperation/active_arms_str
           - /tf
           - /zed/zed_node/left/camera_info
           - /zed/zed_node/right/camera_info
