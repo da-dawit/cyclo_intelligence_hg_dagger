@@ -316,10 +316,19 @@ services:
       # was fixed to require sustained effort over a dwell window (below),
       # not a single sample -- the first attempt at 250 froze on a brief
       # closing-motion transient before the jaws were narrow enough to catch
-      # a thin bolt. 250 is still the threshold measured from the real
-      # sustained-contact signature (~660 held for ~5s); the dwell is what
-      # was actually missing, not the threshold value.
-      - GRIPPER_HOLD_EFFORT_THRESHOLD=400
+      # a thin bolt. The real sustained-contact signature measured on an
+      # actual grasp is ~660, held continuously for ~5s.
+      # 400 (this threshold's value through 2026-08-30) locked the hold in
+      # well before that -- correct to avoid the early-transient false
+      # trigger, but it also means the jaws stop closing on comparatively
+      # little real squeeze force. Raised to 550 (2026-08-31) for a firmer
+      # hold: still a real margin under the 660 signature so the dwell
+      # requirement keeps catching it reliably, but the gripper now closes
+      # further and builds more genuine grip force before freezing. If this
+      # starts missing real grasps (freezing never triggers, policy just
+      # keeps commanding closed with no hold), 550 is too close to 660 for
+      # this object/grip -- back off toward 450-500.
+      - GRIPPER_HOLD_EFFORT_THRESHOLD=550
       - GRIPPER_HOLD_DWELL_S=0.2
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=all
